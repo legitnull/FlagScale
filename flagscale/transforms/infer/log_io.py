@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -17,9 +17,7 @@ class LogIOHook(ModelHook):
     def __init__(self):
         super().__init__()
 
-    def pre_forward(
-        self, module: nn.Module, *args, ctx: Optional[RuntimeContext], **kwargs
-    ) -> tuple[tuple, dict]:
+    def pre_forward(self, module: nn.Module, *args, **kwargs) -> Tuple[Tuple[Any], Dict[str, Any]]:
         def shape_of(x: torch.Tensor) -> str:
             return getattr(x, "shape", type(x).__name__)
 
@@ -45,14 +43,13 @@ class LogIOTransform(Transform):
             after=set(),
         )
 
-    @property
     def spec(self) -> TransformSpec:
         return self._spec
 
     def supports(self, _model: BaseAdapter | nn.Module) -> bool:
         return True
 
-    def preflight(self, _model: BaseAdapter | nn.Module) -> bool:
+    def preflight(self) -> bool:
         return True
 
     def apply(self, model: BaseAdapter) -> bool:
@@ -64,6 +61,7 @@ class LogIOTransform(Transform):
             reg.register_hook(hook, "log_io")
             return True
         elif isinstance(backbone, list) and all(isinstance(m, nn.Module) for m in backbone):
+            # TODO(yupu): Implement this
             raise NotImplementedError("Not implemented for multiple modules")
         else:
             raise ValueError(f"Unsupported backbone type: {type(backbone)}")

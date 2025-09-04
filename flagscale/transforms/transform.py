@@ -51,13 +51,13 @@ class Transform(ABC):
         """
         return True
 
-    # TODO(yupu): Should we just use `supports()`? Or change to no args?
-    def preflight(self, model: BaseAdapter | nn.Module) -> bool:
+    def preflight(self) -> bool:
         """
         Check if a hardware/python package requirement is met.
         """
         return True
 
+    # TODO(yupu): should we add a return type?
     def apply(self, model: BaseAdapter | nn.Module) -> bool:
         """
         Implement in subclasses by using `Hook`s

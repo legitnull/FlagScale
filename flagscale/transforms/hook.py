@@ -1,13 +1,11 @@
+# Modified from https://github.com/huggingface/diffusers/blob/4a7556eaecc9872dea50ce161301edfa6392693c/src/diffusers/hooks/hooks.py
+
 import functools
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from torch import nn
-
-from flagscale.engine.runtime_context import RuntimeContext
-
-# Modified from https://github.com/huggingface/diffusers/blob/4a7556eaecc9872dea50ce161301edfa6392693c/src/diffusers/hooks/hooks.py
 
 
 class ModelHook:
@@ -15,8 +13,8 @@ class ModelHook:
     Hook applied to a module.
     """
 
-    # TODO(yupu): Check if this is needed
-    _is_stateful: bool = False
+    # TODO(yupu): Check if this is needed, should we put all state inside the `RuntimeContext`?
+    # _is_stateful: bool = False
 
     def __init__(self):
         self.fn_ref: "HookFunctionReference" = None
@@ -33,26 +31,39 @@ class ModelHook:
         """
         return module
 
-    # TODO(yupu): Do these args make sense?
-    def pre_forward(
-        self, module: nn.Module, *args, ctx: Optional[RuntimeContext], **kwargs
-    ) -> tuple[tuple, dict]:
+    # TODO(yupu): See if we need to explicitly pass a `RuntimeContext`
+    def pre_forward(self, module: nn.Module, *args, **kwargs) -> Tuple[Tuple[Any], Dict[str, Any]]:
         """
         Called before the module's forward pass.
         """
         return args, kwargs
 
-    def post_forward(self, module: nn.Module, output: Any, ctx: Optional[RuntimeContext]) -> Any:
+    def post_forward(self, module: nn.Module, output: Any) -> Any:
         """
         Called after the module's forward pass.
         """
         return output
 
-    def _set_context(self, name: Optional[str]) -> None:
-        """
-        Optional: switch internal state context slot for this hook.
-        """
-        return None
+    # def _set_context(self, name: Optional[str]) -> None:
+    #     """
+    #     Optional: switch internal state context slot for this hook.
+    #     """
+    #     return None
+
+    # def reset_state(self, module: nn.Module):
+    #     if self._is_stateful:
+    #         raise NotImplementedError(
+    #             "This hook is stateful and needs to implement the `reset_state` method."
+    #         )
+    #     return module
+
+    # def _set_context(self, module: nn.Module, name: str) -> None:
+    #     # Iterate over all attributes of the hook to see if any of them have the type `StateManager`. If so, call `set_context` on them.
+    #     for attr_name in dir(self):
+    #         attr = getattr(self, attr_name)
+    #         if isinstance(attr, StateManager):
+    #             attr.set_context(name)
+    #     return module
 
     # TODO(yupu): do we need this?
     # def custom_forward(self, args: tuple, kwargs: dict, ctx: Optional[RuntimeContext]) -> Callable[..., Any]:
@@ -150,11 +161,9 @@ class ModuleHookRegistry:
         # Build the wrapped forward for this hook
         def make_wrapped(fn_ref: HookFunctionReference):
             def wrapped(module: nn.Module, *args, **kwargs):
-                # TODO(yupu): FIXME
-                args, kwargs = fn_ref.pre_forward(module, *args, ctx=None, **kwargs)
+                args, kwargs = fn_ref.pre_forward(module, *args, **kwargs)
                 output = fn_ref.forward(*args, **kwargs)
-                # TODO(yupu): FIXME
-                return fn_ref.post_forward(module, output, ctx=None)
+                return fn_ref.post_forward(module, output)
 
             return wrapped
 
@@ -165,6 +174,7 @@ class ModuleHookRegistry:
         self._module_ref.forward = new_forward
 
         # Track ordering and links
+        hook.fn_ref = fn_ref
         setattr(fn_ref, "_name", name)
         self._hooks[name] = hook
         self._order.append(name)
@@ -225,7 +235,19 @@ class ModuleHookRegistry:
 
     # TODO(yupu): State may be consumed by the hook, but by definition, it should be a `Transform`'s attribute.
     # TODO(yupu): Is it possible in reality to have multiple contexts for different hooks at the same time?
-    def set_state_context(self, name: Optional[str]) -> None:
-        # Push a small context name into all hooks on this module
-        for hook_name in self._order:
-            self._hooks[hook_name]._set_context(name)
+    # def set_state_context(self, name: Optional[str]) -> None:
+    #     # Push a small context name into all hooks on this module
+    #     for hook_name in self._order:
+    #         self._hooks[hook_name]._set_context(name)
+
+    def __repr__(self) -> str:
+        registry_repr = ""
+        for i, hook_name in enumerate(self._order):
+            if self._hooks[hook_name].__class__.__repr__ is not object.__repr__:
+                hook_repr = self._hooks[hook_name].__repr__()
+            else:
+                hook_repr = self._hooks[hook_name].__class__.__name__
+            registry_repr += f"  ({i}) {hook_name} - {hook_repr}"
+            if i < len(self._order) - 1:
+                registry_repr += "\n"
+        return f"ModuleHookRegistry(\n{registry_repr}\n)"

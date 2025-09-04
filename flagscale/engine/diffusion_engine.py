@@ -12,6 +12,7 @@ from vllm.config import config
 from flagscale.models.adapters import BaseAdapter, create_adapter
 from flagscale.runner.utils import logger
 from flagscale.transforms.infer.log_io import LogIOTransform
+from flagscale.transforms.transform_manager import TransformManager
 
 
 # @config
@@ -90,7 +91,10 @@ class DiffusionEngine:
         print(f"backbone: {backbone}")
 
         log_io_transform = LogIOTransform()
-        log_io_transform.apply(self.adapter)
+        manager = TransformManager([log_io_transform])
+        manager.apply(self.adapter)
+
+        # log_io_transform.apply(self.adapter)
 
         # try:
         outputs = self.pipeline(**kwargs)
