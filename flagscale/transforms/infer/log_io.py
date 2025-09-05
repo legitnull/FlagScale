@@ -1,10 +1,9 @@
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 import torch
 
 from torch import nn
 
-from flagscale.engine.runtime_context import RuntimeContext
 from flagscale.models.adapters import BaseAdapter
 from flagscale.runner.utils import logger
 from flagscale.transforms.hook import ModelHook, ModuleHookRegistry
@@ -14,14 +13,18 @@ from flagscale.transforms.transform import Transform, TransformSpec
 class LogIOHook(ModelHook):
     """A simple hook that logs the input shapes of a module."""
 
-    def __init__(self):
+    def __init__(self, log_level: str = "info"):
         super().__init__()
+        logger_func = getattr(logger, log_level)
+        if logger_func is None:
+            raise ValueError(f"Invalid log level: {log_level}")
+        self._logger_func = logger_func
 
     def pre_forward(self, module: nn.Module, *args, **kwargs) -> Tuple[Tuple[Any], Dict[str, Any]]:
         def shape_of(x: torch.Tensor) -> str:
             return getattr(x, "shape", type(x).__name__)
 
-        logger.info(
+        self._logger_func(
             f"[LogIOHook] {module.__class__.__name__} input shapes: "
             f"{tuple(shape_of(a) for a in args)}"
         )
@@ -57,7 +60,7 @@ class LogIOTransform(Transform):
 
         if isinstance(backbone, nn.Module):
             reg = ModuleHookRegistry.get_or_create_registry(backbone)
-            hook = LogIOHook()
+            hook = LogIOHook(log_level=self._log_level)
             reg.register_hook(hook, "log_io")
             return True
         elif isinstance(backbone, list) and all(isinstance(m, nn.Module) for m in backbone):

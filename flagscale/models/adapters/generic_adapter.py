@@ -16,4 +16,5 @@ class GenericDiffusersAdapter(BaseAdapter):
                 self._model.unet, nn.Module
             ), f"UNet should be a `nn.Module`, but got {type(self._model.unet)}"
             return self._model.unet
+        # TODO(yupu): add support for other models
         raise ValueError(f"Model {self._model} has no unet.")

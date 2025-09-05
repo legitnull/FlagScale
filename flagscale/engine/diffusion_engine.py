@@ -11,8 +11,8 @@ from vllm.config import config
 
 from flagscale.models.adapters import BaseAdapter, create_adapter
 from flagscale.runner.utils import logger
+from flagscale.transforms import TransformManager, create_transforms_from_config
 from flagscale.transforms.infer.log_io import LogIOTransform
-from flagscale.transforms.transform_manager import TransformManager
 
 
 # @config
@@ -34,24 +34,27 @@ class RequestOutput:
 class DiffusionEngine:
     """ """
 
-    def __init__(self, config_dict: DictConfig) -> None:
+    def __init__(self, config_dict: DictConfig, transforms_cfg: DictConfig) -> None:
         # 1) Build pipeline from engine_config
         # 2) Build adapter over the core module (e.g., pipeline.unet)
         # 3) Register optional caps on adapter (simple callables)
         # 4) Select transforms from engine_args/config (pre/compile/post)
         # 5) Plan and apply transforms on adapter.transformers()
 
-        self.validate_config(config_dict)
+        self.validate_config(config_dict, transforms_cfg)
 
         self.pipeline = self.load(self.model_name, **self.model_config)
-        print(f"DiffusionEngine: pipeline: {self.pipeline}")
 
         self.adapter: BaseAdapter = create_adapter(
             self.engine_config.get("adapter", None), self.pipeline
         )
-        print(f"self.adapter type: {type(self.adapter)}")
 
-    def validate_config(self, config_dict: DictConfig) -> None:
+        transforms = create_transforms_from_config(transforms_cfg)
+        if transforms:
+            manager = TransformManager(transforms)
+            manager.apply(self.adapter)
+
+    def validate_config(self, config_dict: DictConfig, transforms_cfg: DictConfig) -> None:
         """Validate the config dict
 
         The config dict consists of 3 parts:
@@ -76,7 +79,7 @@ class DiffusionEngine:
         self.results_path = self.engine_config.results_path
         self.engine_config.pop("results_path")
 
-        self.transforms = config_dict.get("transforms", [])
+        self.transforms_cfg = transforms_cfg
 
     @classmethod
     def from_engine_config(cls, engine_config: DiffusionEngineConfig) -> "DiffusionEngine":
@@ -86,33 +89,21 @@ class DiffusionEngine:
         pass
 
     def generate(self, **kwargs) -> RequestOutput:
-        backbone = self.adapter.backbone()
-        print(f"backbone type: {type(backbone)}")
-        print(f"backbone: {backbone}")
-
-        log_io_transform = LogIOTransform()
-        manager = TransformManager([log_io_transform])
-        manager.apply(self.adapter)
-
-        # log_io_transform.apply(self.adapter)
-
-        # try:
         outputs = self.pipeline(**kwargs)
-        # except ValueError:
-        #     logger.error("Unsupported arguments received: {**kwargs}")
+
         return outputs
 
-    # TODO: load custom models
+    # TODO(yupu): load custom models
     def load(
         self, pretrained_model_name_or_path: Optional[Union[str, os.PathLike]], **kwargs
     ) -> DiffusionPipeline:
         pipeline = DiffusionPipeline.from_pretrained(pretrained_model_name_or_path, **kwargs)
-        # TODO: Read from config
+        # TODO(yupu): Read from config
         pipeline.to("cuda")
-        print(f"unet: {pipeline.unet}")
 
         return pipeline
 
+    # TODO(yupu): save all kinds of outputs, and maybe move to adapter
     def save(self, outputs) -> bool:
         os.makedirs(self.results_path, exist_ok=True)
         image = outputs.images[0]

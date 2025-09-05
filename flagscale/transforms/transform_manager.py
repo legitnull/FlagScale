@@ -6,6 +6,7 @@ from typing import Dict, List, Sequence, Set, Tuple
 import torch.nn as nn
 
 from flagscale.models.adapters import BaseAdapter
+from flagscale.runner.utils import logger
 from flagscale.transforms.transform import Transform, TransformPhase
 
 
@@ -23,15 +24,13 @@ class _PhasePlan:
     post: List[Transform]
 
 
-# TODO(yupu): support dry-run mode
 # TODO(yupu): Optionally support `strict=False` mode, where invalid transforms are pruned along with dependents
 class TransformManager:
     """Orders and executes transforms by phase: pre_compile → compile → post_compile"""
 
-    def __init__(self, transforms: Sequence[Transform], *, dry_run: bool = False) -> None:
+    def __init__(self, transforms: Sequence[Transform]) -> None:
         # Mapping: name -> transform
         self._all: Dict[str, Transform] = {t.spec().name: t for t in transforms}
-        self._dry_run = dry_run
 
     def _partition(
         self, names: Set[str]
@@ -196,16 +195,21 @@ class TransformManager:
             pre=self._sort_phase(pre), compile=self._sort_phase(comp), post=self._sort_phase(post)
         )
 
-    def apply(self, model: nn.Module | BaseAdapter | List[nn.Module]) -> None | str:
+    def apply(
+        self, model: nn.Module | BaseAdapter | List[nn.Module], *, dry_run: bool = False
+    ) -> None | str:
         """Apply the transforms in the order specified by the plan.
 
         Args:
-            model: The model to apply the transforms to.
-            model can be a single nn.Module, BaseAdapter, or List[nn.Module].
+            model: The model to apply the transforms to. model can be a single nn.Module, BaseAdapter, or List[nn.Module].
+            dry_run: If True, only plan the transforms and return the plan.
+
+        Returns:
+            None if dry_run is False, otherwise a string describing the plan.
         """
 
         plan = self.plan(model)
-        if not self._dry_run:
+        if not dry_run:
             for t in plan.pre:
                 t.apply(model)
             for t in plan.compile:
@@ -223,4 +227,8 @@ class TransformManager:
             info += "Post-compile transforms:\n"
             for t in plan.post:
                 info += f"  {t.spec().name}\n"
-            return f"DryRun plan(\n{info})"
+
+            dry_run_info = f"DryRun plan(\n{info})"
+            logger.info(dry_run_info)
+
+            return dry_run_info

@@ -8,7 +8,7 @@ experiment:
   model: prompthero/openjourney
   task:
     type: inference
-    backend: vllm # TODO: Remove this restriction
+    backend: vllm # TODO(yupu): Remove this restriction
     entrypoint: flagscale/inference/diffusion_entrypoint.py
   runner:
     hostfile: null
@@ -17,6 +17,7 @@ experiment:
   envs:
     CUDA_VISIBLE_DEVICES: 4
     CUDA_DEVICE_MAX_CONNECTIONS: 1
+    # Optionally, set HF_HOME and HF_ENDPOINT
     HF_HOME: /share/project/fengyupu/hf_hub
     HF_ENDPOINT: https://hf-mirror.com
 
