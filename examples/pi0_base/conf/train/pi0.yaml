@@ -6,16 +6,15 @@ system:
   seed: 42
   project_name: ${experiment.exp_name}
   exp_name: ${experiment.exp_name}
-  batch_size: 2
+  batch_size: 1
   train_steps: 100
   log_freq: 10
   output_directory: ${experiment.exp_dir}/ckpt
   tokenizer_max_length: 256
 
 model:
-  # change to your model path
+  # Path to the pi0_base model checkpoint
   checkpoint_dir: /share/project/fengyupu/hf_hub/pi0_base
-  # checkpoint_dir: /share/project/fengyupu/hf_hub/pi0
   resume: false
   ckpt_overwrite: true
   # change to your stat_path (lerobot format)
@@ -24,6 +23,8 @@ model:
   action_steps: 30
 
 data:
+  # TODO(yupu): Remove
+  repo_id: lerobot/aloha_mobile_cabinet
   # change to your tokenizer path
   tokenizer_path: /share/project/fengyupu/hf_hub/paligemma-3b-pt-224
   # change to your data path
