@@ -59,6 +59,49 @@ IMAGENET_STATS = {
     "std": [[[0.229]], [[0.224]], [[0.225]]],  # (c,1,1)
 }
 
+from pprint import pformat
+import dataclasses, json
+
+def dump_runtime(config, pi0_config, processor_kwargs, postprocessor_kwargs, optimizer=None, lr_scheduler=None, device=None):
+    print("=== train args (Namespace) ===")
+    print(config)
+
+    print("\n=== PI0Config ===")
+    if dataclasses.is_dataclass(pi0_config):
+        print(json.dumps(dataclasses.asdict(pi0_config), indent=2, default=str))
+    else:
+        print(pi0_config)
+
+    print("\n=== Processor kwargs ===")
+    print(pformat(processor_kwargs))
+    print("\n=== Postprocessor kwargs ===")
+    print(pformat(postprocessor_kwargs))
+
+    if optimizer:
+        print("\n=== Optimizer ===")
+        print(type(optimizer).__name__)
+        for i, g in enumerate(optimizer.param_groups):
+            print(f"group {i}: lr={g['lr']}, betas={g.get('betas')}, eps={g.get('eps')}, wd={g.get('weight_decay')}")
+
+    if lr_scheduler:
+        print("\n=== LR Scheduler state ===")
+        print(lr_scheduler.state_dict())
+
+    print("\n=== Device / AMP ===")
+    print(f"device: {device}")
+    print(f"cudnn.benchmark: {torch.backends.cudnn.benchmark}, deterministic: {torch.backends.cudnn.deterministic}")
+
+
+def set_seed(seed: int):
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.enabled = True
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cuda.matmul.allow_tf32 = True
 
 def init_ddp(config):
     # TODO(yupu): to a function
@@ -232,7 +275,8 @@ def make_policy(
     features = dataset_to_policy_features(ds_meta.features)
 
     cfg.output_features = {
-        key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION
+        # Changed from ft.type is FeatureType.ACTION to ft.type == FeatureType.ACTION for different enum classes: flagscale.FeatureType vs lerobot.FeatureType
+        key: ft for key, ft in features.items() if ft.type == FeatureType.ACTION
     }
     if not cfg.input_features:
         cfg.input_features = {
@@ -430,6 +474,7 @@ def update_policy(
     # Let accelerator handle mixed precision
     with accelerator.autocast():
         loss, output_dict = policy.forward(batch)
+    logger.info(f"loss: {loss.item()}")
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
 
     # Use accelerator's backward method
@@ -478,15 +523,11 @@ def main(config):
     import debugpy
     import os
 
-    # (
-    #     debugpy.listen(("0.0.0.0", 5678)),
-    #     debugpy.wait_for_client(),
-    #     debugpy.breakpoint(),
-    # ) if not debugpy.is_client_connected() else None
-
     # Choose between Accelerator (like lerobot) or manual DDP
     use_accelerator = True  # config.use_accelerator
     accelerator = None
+
+    set_seed(config.seed)
 
     if use_accelerator:
         # Use Accelerator like lerobot does
@@ -503,6 +544,13 @@ def main(config):
         device = torch.device("cuda", local_rank)
         rank = dist.get_rank()
         is_main_process = rank == 0
+
+    # if is_main_process:
+    #     (
+    #         debugpy.listen(("0.0.0.0", 9096)),
+    #         debugpy.wait_for_client(),
+    #         debugpy.breakpoint(),
+    #     ) if not debugpy.is_client_connected() else None
 
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -539,6 +587,16 @@ def main(config):
         ds_meta=dataset.meta,
         rename_map=None,
     )
+
+
+
+    # policy.eval()
+    # batch = torch.load(f"batch_after_preprocessor_0_{accelerator.process_index}.pt")
+    # with torch.no_grad():
+    #     loss, output_dict = policy.forward(batch)
+    # logger.info(f"loss: {loss.item()}")
+    # import sys
+    # sys.exit()
 
     if use_accelerator:
         accelerator.wait_for_everyone()
@@ -677,6 +735,17 @@ def main(config):
     # TODO(yupu): to config
     grad_clip_norm = 1.0
 
+    if is_main_process:
+        dump_runtime(
+            config=config,
+            pi0_config=pi0_config,
+            processor_kwargs=processor_kwargs,
+            postprocessor_kwargs=postprocessor_kwargs,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            device=device,
+        )
+
     for _ in range(step, config.train_steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
@@ -688,6 +757,13 @@ def main(config):
             }
 
         batch = preprocessor(batch)
+
+        # if use_accelerator:
+        #     torch.save(
+        #         batch, f"batch_after_preprocessor_{step}_{accelerator.process_index}.pt"
+        #     )
+        # else:
+        #     torch.save(batch, f"batch_after_preprocessor_{step}_{dist.get_rank()}.pt")
 
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
@@ -702,8 +778,18 @@ def main(config):
             lr_scheduler=lr_scheduler,
         )
 
-        print(f"train_tracker: {train_tracker}")
+        print(f"train_tracker at step {step}: {train_tracker}")
 
+        import sys
+
+        # if step == 5:
+        #     sys.exit()
+
+
+        # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
+        # increment `step` here.
+        step += 1
+        train_tracker.step()
 
         # if use_accelerator:
         #     torch.save(
@@ -711,10 +797,6 @@ def main(config):
         #     )
         # else:
         #     torch.save(batch, f"batch_after_preprocessor_{step}_{dist.get_rank()}.pt")
-
-        import sys
-
-        sys.exit()
 
     # if use_accelerator:
     #     torch.save(loss, f"loss_{accelerator.process_index}.pt")
