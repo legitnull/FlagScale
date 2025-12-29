@@ -29,15 +29,15 @@ import wandb
 from flagscale.runner.utils import logger
 
 # TODO(yupu): prune
-from lerobot.datasets.transforms import ImageTransforms
-from lerobot.datasets.lerobot_dataset import (
+from flagscale.train.datasets.transforms import ImageTransforms
+from flagscale.train.datasets.lerobot_dataset import (
     LeRobotDataset,
     LeRobotDatasetMetadata,
 )
-from lerobot.datasets.utils import dataset_to_policy_features
+from flagscale.train.datasets.utils import dataset_to_policy_features
 
-from lerobot.processor import PolicyAction, PolicyProcessorPipeline
-from lerobot.processor.converters import (
+from flagscale.train.processor import PolicyAction, PolicyProcessorPipeline
+from flagscale.train.processor.converters import (
     batch_to_transition,
     policy_action_to_transition,
     transition_to_batch,

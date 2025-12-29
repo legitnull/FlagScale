@@ -23,7 +23,7 @@ import torch
 from flagscale.models.configs.types import PipelineFeatureType, PolicyFeature
 from flagscale.models.pi0_base.configuration_pi0 import PI0Config
 
-from lerobot.processor import (
+from flagscale.train.processor import (
     AddBatchDimensionProcessorStep,
     ComplementaryDataProcessorStep,
     DeviceProcessorStep,
@@ -36,7 +36,7 @@ from lerobot.processor import (
     TokenizerProcessorStep,
     UnnormalizerProcessorStep,
 )
-from lerobot.processor.converters import (
+from flagscale.train.processor.converters import (
     policy_action_to_transition,
     transition_to_policy_action,
 )
@@ -46,7 +46,7 @@ from flagscale.models.utils.constants import (
 )
 
 
-# @ProcessorStepRegistry.register(name="pi0_new_line_processor")
+@ProcessorStepRegistry.register(name="pi0_new_line_processor")
 class Pi0NewLineProcessor(ComplementaryDataProcessorStep):
     """
     Ensures that the task description string ends with a newline character.

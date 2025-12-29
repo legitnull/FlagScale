@@ -37,10 +37,13 @@ from transformers.models.paligemma.modeling_paligemma import (
 
 # from lerobot.configs.policies import PreTrainedConfig
 from flagscale.models.pi0_base.configuration_pi0 import DEFAULT_IMAGE_SIZE, PI0Config
-from flagscale.models.policies.pretrained import PreTrainedPolicy, T
+# from flagscale.models.policies.pretrained import PreTrainedPolicy, T
+from typing import TypeVar
+
+T = TypeVar("T", bound="PI0Policy")
 
 # TODO(yupu): Remove this
-from lerobot.policies.rtc.modeling_rtc import RTCProcessor
+# from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 
 from flagscale.models.utils.constants import (
     ACTION,
@@ -539,10 +542,10 @@ class PaliGemmaWithExpertModel(
 class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     """Core PI0 PyTorch model."""
 
-    def __init__(self, config: PI0Config, rtc_processor: RTCProcessor | None = None):
+    def __init__(self, config: PI0Config): #, rtc_processor: RTCProcessor | None = None):
         super().__init__()
         self.config = config
-        self.rtc_processor = rtc_processor
+        # self.rtc_processor = rtc_processor
 
         paligemma_config = get_gemma_config(config.paligemma_variant)
         action_expert_config = get_gemma_config(config.action_expert_variant)
@@ -904,7 +907,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     timestep=current_timestep,
                 )
 
-            if self._rtc_enabled():
+            if False and self._rtc_enabled():
                 inference_delay = kwargs.get("inference_delay")
                 prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
                 execution_horizon = kwargs.get("execution_horizon")
@@ -922,8 +925,8 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
             x_t = x_t + dt * v_t
 
-            if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
-                self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
+            # if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
+            #     self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
 
         return x_t
 
@@ -993,8 +996,8 @@ class PI0Policy(nn.Module):
         self.config = config
 
         # Initialize the core PI0 model
-        self.init_rtc_processor()
-        self.model = PI0Pytorch(config, rtc_processor=self.rtc_processor)
+        # self.init_rtc_processor()
+        self.model = PI0Pytorch(config) #, rtc_processor=self.rtc_processor)
 
         # Enable gradient checkpointing if requested
         if config.gradient_checkpointing:
@@ -1181,21 +1184,22 @@ class PI0Policy(nn.Module):
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
 
-    def init_rtc_processor(self):
-        """Initialize RTC processor if RTC is enabled in config."""
-        self.rtc_processor = None
+    # def init_rtc_processor(self):
+    #     """Initialize RTC processor if RTC is enabled in config."""
+    #     self.rtc_processor = None
 
-        # Create processor if config provided
-        # If RTC is not enabled - we can still track the denoising data
-        if self.config.rtc_config is not None:
-            self.rtc_processor = RTCProcessor(self.config.rtc_config)
+    #     # Create processor if config provided
+    #     # If RTC is not enabled - we can still track the denoising data
+    #     if self.config.rtc_config is not None:
+    #         self.rtc_processor = RTCProcessor(self.config.rtc_config)
 
-            model_value = getattr(self, "model", None)
-            if model_value is not None:
-                model_value.rtc_processor = self.rtc_processor
+    #         model_value = getattr(self, "model", None)
+    #         if model_value is not None:
+    #             model_value.rtc_processor = self.rtc_processor
 
     def _rtc_enabled(self) -> bool:
-        return self.config.rtc_config is not None and self.config.rtc_config.enabled
+        return False
+        # return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
     def _preprocess_images(
         self, batch: dict[str, Tensor]
