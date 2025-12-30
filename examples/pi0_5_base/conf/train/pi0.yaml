@@ -11,26 +11,26 @@ system:
   log_freq: 10
   output_directory: ${experiment.exp_dir}/ckpt
   tokenizer_max_length: 256
-  save_checkpoint: true
+  save_checkpoint: false
   save_freq: 1
 
 model:
   # Path to the pi0_base model checkpoint
-  checkpoint_dir: /share/project/fengyupu/hf_hub/pi0_base
+  checkpoint_dir: /share/project/fengyupu/hf_hub/models/lerobot/pi05_base 
   resume: false
   ckpt_overwrite: true
   # change to your stat_path (lerobot format)
-  stat_path: /share/project/fengyupu/hf_hub/aloha_mobile_cabinet/meta/stats.json
+  # stat_path: /share/project/fengyupu/hf_hub/aloha_mobile_cabinet/meta/stats.json
   action_horizon: 14
   action_steps: 30
 
 data:
   # TODO(yupu): Remove
-  repo_id: lerobot/aloha_mobile_cabinet
+  repo_id: foo 
   # change to your tokenizer path
   tokenizer_path: /share/project/fengyupu/hf_hub/paligemma-3b-pt-224
   # change to your data path
-  data_path: /share/project/fengyupu/tmp/flag-scale/demo_0913_n2/wds-2 
+  data_path: /share/project/fengyupu/hf_hub/aloha_mobile_cabinet
   state_key: eepose
   action_key: eepose
   action_token_key: action_eepose_token

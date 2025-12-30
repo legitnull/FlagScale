@@ -1,5 +1,12 @@
-rm /share/project/fengyupu/github/FlagScale/outputs/PI0_BASE/logs/host_0_localhost.output
+# rm /share/project/fengyupu/github/FlagScale/outputs/PI0_BASE/logs/host_0_localhost.output
+# python run.py \
+# 	--config-path ./examples/pi0_base/conf \
+# 	--config-name train \
+# 	action=run
+
+
+rm /share/project/fengyupu/github/FlagScale/outputs/PI05_BASE/logs/host_0_localhost.output
 python run.py \
-	--config-path ./examples/pi0_base/conf \
+	--config-path ./examples/pi0_5_base/conf \
 	--config-name train \
 	action=run

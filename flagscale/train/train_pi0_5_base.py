@@ -49,9 +49,9 @@ from flagscale.models.utils.constants import (
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
 
-from flagscale.models.pi0_base.configuration_pi0 import PI0Config
+from flagscale.models.pi05.configuration_pi05 import PI05Config
 from flagscale.models.utils.constants import ACTION, OBS_PREFIX, REWARD
-from flagscale.models.pi0_base.modeling_pi0 import PI0Policy
+from flagscale.models.pi05.modeling_pi05 import PI05Policy
 from flagscale.models.configs.types import FeatureType
 from flagscale.train.utils.logging_utils import AverageMeter, MetricsTracker
 from flagscale.train.utils.train_utils import save_checkpoint, get_step_checkpoint_dir, update_last_checkpoint
@@ -67,7 +67,7 @@ import dataclasses, json
 
 def dump_runtime(
     config,
-    pi0_config,
+    pi05_config,
     processor_kwargs,
     postprocessor_kwargs,
     optimizer=None,
@@ -77,11 +77,11 @@ def dump_runtime(
     print("=== train args (Namespace) ===")
     print(config)
 
-    print("\n=== PI0Config ===")
-    if dataclasses.is_dataclass(pi0_config):
-        print(json.dumps(dataclasses.asdict(pi0_config), indent=2, default=str))
+    print("\n=== PI05Config ===")
+    if dataclasses.is_dataclass(pi05_config):
+        print(json.dumps(dataclasses.asdict(pi05_config), indent=2, default=str))
     else:
-        print(pi0_config)
+        print(pi05_config)
 
     print("\n=== Processor kwargs ===")
     print(pformat(processor_kwargs))
@@ -161,7 +161,7 @@ def init_wandb(config, *, resuming: bool, log_code: bool = False, enabled: bool 
         wandb.run.log_code(epath.Path(__file__).parent.parent)
 
 
-def make_dataset(cfg, pi0_config: PI0Config):
+def make_dataset(cfg, pi05_config: PI05Config):
     # TODO(yupu): to config
     cfg.enable_image_transform = False
     cfg.tolerance_s = 0.0001
@@ -175,7 +175,7 @@ def make_dataset(cfg, pi0_config: PI0Config):
     # TODO(yupu): Remove repo_id and use local data without downloading from hub
     ds_meta = LeRobotDatasetMetadata(cfg.repo_id, root=cfg.data_path, revision=None)
 
-    delta_timestamps = resolve_delta_timestamps(pi0_config, ds_meta)
+    delta_timestamps = resolve_delta_timestamps(pi05_config, ds_meta)
     # # TODO(yupu): Remove repo_id
     dataset = LeRobotDataset(
         cfg.repo_id,
@@ -199,12 +199,12 @@ def make_dataset(cfg, pi0_config: PI0Config):
 
 
 def resolve_delta_timestamps(
-    cfg: PI0Config, ds_meta: LeRobotDatasetMetadata
+    cfg: PI05Config, ds_meta: LeRobotDatasetMetadata
 ) -> dict[str, list] | None:
     """Resolves delta_timestamps by reading from the 'delta_indices' properties of the PreTrainedConfig.
 
     Args:
-        cfg (PI0Config): The PI0Config to read delta_indices from.
+        cfg (PI05Config): The PI05Config to read delta_indices from.
         ds_meta (LeRobotDatasetMetadata): The dataset from which features and fps are used to build
             delta_timestamps against.
 
@@ -261,10 +261,10 @@ def cycle(iterable: Any) -> Iterator[Any]:
 
 
 def make_policy(
-    cfg: PI0Config,
+    cfg: PI05Config,
     ds_meta: LeRobotDatasetMetadata | None = None,
     rename_map: dict[str, str] | None = None,
-) -> PI0Policy:
+) -> PI05Policy:
     """
     Instantiate a policy model.
 
@@ -285,7 +285,7 @@ def make_policy(
         An instantiated and device-placed policy model.
     """
 
-    policy_cls = PI0Policy
+    policy_cls = PI05Policy
 
     kwargs = {}
     features = dataset_to_policy_features(ds_meta.features)
@@ -344,7 +344,7 @@ class ProcessorConfigKwargs(TypedDict, total=False):
 
 
 def make_pre_post_processors(
-    policy_cfg: PI0Config,
+    policy_cfg: PI05Config,
     pretrained_path: str | None = None,
     **kwargs: Unpack[ProcessorConfigKwargs],
 ) -> tuple[
@@ -457,7 +457,7 @@ def has_method(cls: object, method_name: str) -> bool:
 
 def update_policy(
     train_metrics: MetricsTracker,
-    policy: PI0Policy,
+    policy: PI05Policy,
     batch: Any,
     optimizer: Optimizer,
     grad_clip_norm: float,
@@ -584,24 +584,24 @@ def main(config):
         resuming = config.resume
         init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
-    pi0_config = PI0Config.from_pretrained(config.checkpoint_dir)
+    pi05_config = PI05Config.from_pretrained(config.checkpoint_dir)
     # TODO(yupu): Ugly
-    pi0_config.pretrained_path = config.checkpoint_dir
-    pi0_config.device = device
-    print(f"pi0_config: {pi0_config}")
+    pi05_config.pretrained_path = config.checkpoint_dir
+    pi05_config.device = device
+    print(f"pi05_config: {pi05_config}")
 
     if (use_accelerator and is_main_process) or not use_accelerator:
         # Each process needs its own dataset for DDP training
-        dataset = make_dataset(config, pi0_config)
+        dataset = make_dataset(config, pi05_config)
 
     if use_accelerator and not is_main_process:
-        dataset = make_dataset(config, pi0_config)
+        dataset = make_dataset(config, pi05_config)
 
     if use_accelerator:
         accelerator.wait_for_everyone()
 
     policy = make_policy(
-        cfg=pi0_config,
+        cfg=pi05_config,
         ds_meta=dataset.meta,
         rename_map=None,
     )
@@ -654,8 +654,8 @@ def main(config):
     }
 
     preprocessor, postprocessor = make_pre_post_processors(
-        policy_cfg=pi0_config,
-        pretrained_path=pi0_config.pretrained_path,
+        policy_cfg=pi05_config,
+        pretrained_path=pi05_config.pretrained_path,
         **processor_kwargs,
         **postprocessor_kwargs,
     )
@@ -663,16 +663,16 @@ def main(config):
     # TODO(yupu): to config
     optimizer = torch.optim.AdamW(
         policy.parameters(),
-        lr=pi0_config.optimizer_lr,
-        betas=pi0_config.optimizer_betas,
-        eps=pi0_config.optimizer_eps,
-        weight_decay=pi0_config.optimizer_weight_decay,
+        lr=pi05_config.optimizer_lr,
+        betas=pi05_config.optimizer_betas,
+        eps=pi05_config.optimizer_eps,
+        weight_decay=pi05_config.optimizer_weight_decay,
     )
     scheduler_config = CosineDecayWithWarmupSchedulerConfig(
-        num_warmup_steps=pi0_config.scheduler_warmup_steps,
-        num_decay_steps=pi0_config.scheduler_decay_steps,
-        peak_lr=pi0_config.optimizer_lr,
-        decay_lr=pi0_config.scheduler_decay_lr,
+        num_warmup_steps=pi05_config.scheduler_warmup_steps,
+        num_decay_steps=pi05_config.scheduler_decay_steps,
+        peak_lr=pi05_config.optimizer_lr,
+        decay_lr=pi05_config.scheduler_decay_lr,
     )
     lr_scheduler = scheduler_config.build(optimizer, config.train_steps)
 
@@ -754,7 +754,7 @@ def main(config):
     if is_main_process:
         dump_runtime(
             config=config,
-            pi0_config=pi0_config,
+            pi05_config=pi05_config,
             processor_kwargs=processor_kwargs,
             postprocessor_kwargs=postprocessor_kwargs,
             optimizer=optimizer,
@@ -786,13 +786,14 @@ def main(config):
             lr_scheduler=lr_scheduler,
         )
 
-        # print(f"train_tracker at step {step}: {train_tracker}")
+        print(f"train_tracker at step {step}: {train_tracker}")
 
         step += 1
         train_tracker.step()
 
         if step % config.log_freq == 0 and is_main_process:
-            logger.info(f"step: {step} loss: {train_tracker}")
+            continue
+            # logger.info(f"step: {step} loss: {train_tracker}")
 
         if config.save_checkpoint and step % config.save_freq == 0:
             if is_main_process:
@@ -931,5 +932,5 @@ if __name__ == "__main__":
     config = parser.parse_args()
 
     logger.info("=" * 100)
-    logger.info(f"train_pi0_base.py config: {config}")
+    logger.info(f"train_pi0_5_base.py config: {config}")
     main(config)
