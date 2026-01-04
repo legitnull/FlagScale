@@ -1,9 +1,10 @@
 import argparse
+import json
 from pathlib import Path
 from typing import Any, Iterator, TypedDict
+import wandb
 import os
 import pathlib
-import platform
 import random
 from dataclasses import dataclass
 from typing_extensions import Unpack
@@ -11,8 +12,7 @@ import math
 import time
 from contextlib import nullcontext
 
-
-import etils.epath as epath
+# import etils.epath as epath
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -22,21 +22,13 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 
-import wandb
-
-# from megatron.energon import WorkerConfig, get_loader, get_train_dataset
-# from tools.datasets.vla.data.dataset_helpers import TaskEncoder
-
 from flagscale.runner.utils import logger
-
-# TODO(yupu): prune
 from flagscale.train.datasets.transforms import ImageTransforms
 from flagscale.train.datasets.lerobot_dataset import (
     LeRobotDataset,
     LeRobotDatasetMetadata,
 )
 from flagscale.train.datasets.utils import dataset_to_policy_features
-
 from flagscale.train.processor import PolicyAction, PolicyProcessorPipeline
 from flagscale.train.processor.converters import (
     batch_to_transition,
@@ -48,11 +40,13 @@ from flagscale.models.utils.constants import (
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
-
-from flagscale.models.pi05_lerobot.configuration_pi05 import PI05Config
+from flagscale.models.configs.types import PolicyFeature
 from flagscale.models.utils.constants import ACTION, OBS_PREFIX, REWARD
-from flagscale.models.pi05_lerobot.modeling_pi05 import PI05Policy
 from flagscale.models.configs.types import FeatureType
+from flagscale.models.pi0_lerobot.configuration_pi0 import PI0Config
+from flagscale.models.pi0_lerobot.modeling_pi0 import PI0Policy
+from flagscale.models.pi05_lerobot.configuration_pi05 import PI05Config
+from flagscale.models.pi05_lerobot.modeling_pi05 import PI05Policy
 from flagscale.train.utils.logging_utils import AverageMeter, MetricsTracker
 from flagscale.train.utils.train_utils import (
     save_checkpoint,
@@ -65,51 +59,6 @@ IMAGENET_STATS = {
     "std": [[[0.229]], [[0.224]], [[0.225]]],  # (c,1,1)
 }
 
-from pprint import pformat
-import dataclasses, json
-
-
-def dump_runtime(
-    config,
-    pi05_config,
-    processor_kwargs,
-    postprocessor_kwargs,
-    optimizer=None,
-    lr_scheduler=None,
-    device=None,
-):
-    print("=== train args (Namespace) ===")
-    print(config)
-
-    print("\n=== PI05Config ===")
-    if dataclasses.is_dataclass(pi05_config):
-        print(json.dumps(dataclasses.asdict(pi05_config), indent=2, default=str))
-    else:
-        print(pi05_config)
-
-    print("\n=== Processor kwargs ===")
-    print(pformat(processor_kwargs))
-    print("\n=== Postprocessor kwargs ===")
-    print(pformat(postprocessor_kwargs))
-
-    if optimizer:
-        print("\n=== Optimizer ===")
-        print(type(optimizer).__name__)
-        for i, g in enumerate(optimizer.param_groups):
-            print(
-                f"group {i}: lr={g['lr']}, betas={g.get('betas')}, eps={g.get('eps')}, wd={g.get('weight_decay')}"
-            )
-
-    if lr_scheduler:
-        print("\n=== LR Scheduler state ===")
-        print(lr_scheduler.state_dict())
-
-    print("\n=== Device / AMP ===")
-    print(f"device: {device}")
-    print(
-        f"cudnn.benchmark: {torch.backends.cudnn.benchmark}, deterministic: {torch.backends.cudnn.deterministic}"
-    )
-
 
 def set_seed(seed: int):
     np.random.seed(seed)
@@ -117,72 +66,58 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
     torch.backends.cudnn.enabled = True
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
 
-def init_ddp(config):
-    # TODO(yupu): to a function
-    np.random.seed(config.seed)
-    random.seed(config.seed)
-    torch.manual_seed(config.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(config.seed)
-
+def init_ddp():
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     torch.distributed.init_process_group(backend="nccl", init_method="env://")
-    torch.backends.cudnn.enabled = True
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cudnn.deterministic = True
-
-    # To match lerobot_train.py
-    torch.backends.cuda.matmul.allow_tf32 = True
 
     return local_rank
 
 
-def init_wandb(config, *, resuming: bool, log_code: bool = False, enabled: bool = True):
-    if not enabled:
-        wandb.init(mode="disabled")
-        return
+# TODO: (yupu) Re-enable wandb
+# def init_wandb(config, *, resuming: bool, log_code: bool = False, enabled: bool = True):
+#     if not enabled:
+#         wandb.init(mode="disabled")
+#         return
 
-    ckpt_dir = pathlib.Path(config.checkpoint_dir)
-    if not ckpt_dir.exists():
-        raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
-    if resuming:
-        run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
-    else:
-        wandb.init(
-            name=config.exp_name, config=vars(config), project=config.project_name
-        )
-        (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
+#     ckpt_dir = pathlib.Path(config.checkpoint_dir)
+#     if not ckpt_dir.exists():
+#         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
+#     if resuming:
+#         run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
+#         wandb.init(id=run_id, resume="must", project=config.project_name)
+#     else:
+#         wandb.init(
+#             name=config.exp_name, config=vars(config), project=config.project_name
+#         )
+#         (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
 
-    if log_code:
-        wandb.run.log_code(epath.Path(__file__).parent.parent)
+#     if log_code:
+#         wandb.run.log_code(epath.Path(__file__).parent.parent)
 
 
-def make_dataset(cfg, pi05_config: PI05Config):
-    # TODO(yupu): to config
+def make_dataset(cfg, policy_config):
+    # TODO: (yupu) Support image transforms
     cfg.enable_image_transform = False
-    cfg.tolerance_s = 0.0001
+    # TODO: (yupu) Remove hard-coded video backend
     cfg.video_backend = "pyav"
-    cfg.use_imagenet_stats = True
 
     image_transforms = (
         ImageTransforms(cfg.image_transforms) if cfg.enable_image_transform else None
     )
     # Leave the revision to None
-    # TODO(yupu): Remove repo_id and use local data without downloading from hub
     ds_meta = LeRobotDatasetMetadata(root=cfg.data_path, revision=None)
+    delta_timestamps = resolve_delta_timestamps(policy_config, ds_meta)
 
-    delta_timestamps = resolve_delta_timestamps(pi05_config, ds_meta)
-    # # TODO(yupu): Remove repo_id
+    # Create dataset - both pi0 and pi0.5 use the same API
     dataset = LeRobotDataset(
-        cfg.repo_id,
         root=cfg.data_path,
         episodes=None,
         delta_timestamps=delta_timestamps,
@@ -203,12 +138,12 @@ def make_dataset(cfg, pi05_config: PI05Config):
 
 
 def resolve_delta_timestamps(
-    cfg: PI05Config, ds_meta: LeRobotDatasetMetadata
+    cfg, ds_meta: LeRobotDatasetMetadata
 ) -> dict[str, list] | None:
     """Resolves delta_timestamps by reading from the 'delta_indices' properties of the PreTrainedConfig.
 
     Args:
-        cfg (PI05Config): The PI05Config to read delta_indices from.
+        cfg: The policy config (PI0Config or PI05Config) to read delta_indices from.
         ds_meta (LeRobotDatasetMetadata): The dataset from which features and fps are used to build
             delta_timestamps against.
 
@@ -237,11 +172,6 @@ def resolve_delta_timestamps(
     return delta_timestamps
 
 
-# TODO(yupu): check if this is correct
-def is_main_process():
-    return dist.get_rank() == 0 and int(os.environ["LOCAL_RANK"]) == 0
-
-
 # datasets/utils.py
 def cycle(iterable: Any) -> Iterator[Any]:
     """Create a dataloader-safe cyclical iterator.
@@ -264,11 +194,53 @@ def cycle(iterable: Any) -> Iterator[Any]:
             iterator = iter(iterable)
 
 
+def raise_feature_mismatch_error(
+    provided_features: set[str],
+    expected_features: set[str],
+) -> None:
+    """
+    Raises a standardized ValueError for feature mismatches between dataset/environment and policy config.
+    """
+    missing = expected_features - provided_features
+    extra = provided_features - expected_features
+    # TODO (jadechoghari): provide a dynamic rename map suggestion to the user.
+    raise ValueError(
+        f"Feature mismatch between dataset/environment and policy config.\n"
+        f"- Missing features: {sorted(missing) if missing else 'None'}\n"
+        f"- Extra features: {sorted(extra) if extra else 'None'}\n\n"
+        f"Please ensure your dataset and policy use consistent feature names.\n"
+        f"If your dataset uses different observation keys (e.g., cameras named differently), "
+        f"use the `--rename_map` argument, for example:\n"
+        f'  --rename_map=\'{{"observation.images.left": "observation.images.camera1", '
+        f'"observation.images.top": "observation.images.camera2"}}\''
+    )
+
+
+def validate_visual_features_consistency(
+    cfg: PI0Config,
+    features: dict[str, PolicyFeature],
+) -> None:
+    """
+    Validates visual feature consistency between a policy config and provided dataset/environment features.
+
+    Args:
+        cfg (PreTrainedConfig): The model or policy configuration containing input_features and type.
+        features (Dict[str, PolicyFeature]): A mapping of feature names to PolicyFeature objects.
+    """
+    expected_visuals = {
+        k for k, v in cfg.input_features.items() if v.type == FeatureType.VISUAL
+    }
+    provided_visuals = {k for k, v in features.items() if v.type == FeatureType.VISUAL}
+    if not provided_visuals.issubset(expected_visuals):
+        raise_feature_mismatch_error(provided_visuals, expected_visuals)
+
+
 def make_policy(
-    cfg: PI05Config,
+    cfg,
     ds_meta: LeRobotDatasetMetadata | None = None,
     rename_map: dict[str, str] | None = None,
-) -> PI05Policy:
+    model_variant: str = "pi0",
+):
     """
     Instantiate a policy model.
 
@@ -278,24 +250,30 @@ def make_policy(
     can either initialize a new policy from scratch or load a pretrained one.
 
     Args:
-        cfg: The configuration for the policy to be created. If `cfg.pretrained_path` is
-             set, the policy will be loaded with weights from that path.
+        cfg: The configuration for the policy to be created (PI0Config or PI05Config).
+             If `cfg.pretrained_path` is set, the policy will be loaded with weights from that path.
         ds_meta: Dataset metadata used to infer feature shapes and types. Also provides
                  statistics for normalization layers.
         rename_map: Optional mapping of dataset or environment feature keys to match
                  expected policy feature names (e.g., `"left"` → `"camera1"`).
+        model_variant: Model variant to use, either "pi0" or "pi0.5".
 
     Returns:
-        An instantiated and device-placed policy model.
+        An instantiated and device-placed policy model (PI0Policy or PI05Policy).
     """
 
-    policy_cls = PI05Policy
+    # Select policy class based on model variant
+    if model_variant == "pi0.5":
+        policy_cls = PI05Policy
+    else:
+        policy_cls = PI0Policy
 
     kwargs = {}
     features = dataset_to_policy_features(ds_meta.features)
 
     cfg.output_features = {
-        # Changed from ft.type is FeatureType.ACTION to ft.type == FeatureType.ACTION for different enum classes: flagscale.FeatureType vs lerobot.FeatureType
+        # Changed from ft.type is FeatureType.ACTION to ft.type == FeatureType.ACTION
+        # for different enum classes: flagscale.FeatureType vs lerobot.FeatureType
         key: ft
         for key, ft in features.items()
         if ft.type == FeatureType.ACTION
@@ -317,9 +295,8 @@ def make_policy(
 
     # policy = torch.compile(policy, mode="reduce-overhead")
 
-    # TODO(yupu): Risky
-    # if not rename_map:
-    #     validate_visual_features_consistency(cfg, features)
+    if not rename_map:
+        validate_visual_features_consistency(cfg, features)
     # TODO: (jadechoghari) - add a check_state(cfg, features) and check_action(cfg, features)
 
     return policy
@@ -348,7 +325,6 @@ class ProcessorConfigKwargs(TypedDict, total=False):
 
 
 def make_pre_post_processors(
-    policy_cfg: PI05Config,
     pretrained_path: str | None = None,
     **kwargs: Unpack[ProcessorConfigKwargs],
 ) -> tuple[
@@ -461,11 +437,11 @@ def has_method(cls: object, method_name: str) -> bool:
 
 def update_policy(
     train_metrics: MetricsTracker,
-    policy: PI05Policy,
+    policy,
     batch: Any,
     optimizer: Optimizer,
     grad_clip_norm: float,
-    accelerator: Accelerator,
+    accelerator: Accelerator | None,
     lr_scheduler=None,
     lock=None,
 ) -> tuple[MetricsTracker, dict]:
@@ -473,15 +449,15 @@ def update_policy(
     Performs a single training step to update the policy's weights.
 
     This function executes the forward and backward passes, clips gradients, and steps the optimizer and
-    learning rate scheduler. Accelerator handles mixed-precision training automatically.
+    learning rate scheduler. Supports both Accelerator and DDP for distributed training.
 
     Args:
         train_metrics: A MetricsTracker instance to record training statistics.
-        policy: The policy model to be trained.
+        policy: The policy model to be trained (wrapped in DDP if not using Accelerator).
         batch: A batch of training data.
         optimizer: The optimizer used to update the policy's parameters.
         grad_clip_norm: The maximum norm for gradient clipping.
-        accelerator: The Accelerator instance for distributed training and mixed precision.
+        accelerator: The Accelerator instance for distributed training and mixed precision, or None for DDP.
         lr_scheduler: An optional learning rate scheduler.
         lock: An optional lock for thread-safe optimizer updates.
 
@@ -493,27 +469,50 @@ def update_policy(
     start_time = time.perf_counter()
     policy.train()
 
-    # Let accelerator handle mixed precision
-    with accelerator.autocast():
-        loss, output_dict = policy.forward(batch)
-    logger.info(f"loss: {loss.item()}")
+    # Handle mixed precision: Accelerator or torch.cuda.amp
+    if accelerator is not None:
+        with accelerator.autocast():
+            loss, output_dict = policy.forward(batch)
+    else:
+        with torch.amp.autocast("cuda"):
+            loss, output_dict = policy.forward(batch)
     # TODO(rcadene): policy.unnormalize_outputs(out_dict)
 
-    # Use accelerator's backward method
-    accelerator.backward(loss)
+    if accelerator is not None:
+        accelerator.backward(loss)
+    else:
+        loss.backward()
 
     # Clip gradients if specified
     if grad_clip_norm > 0:
-        grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+        if accelerator is not None:
+            grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+        else:
+            # For DDP, get the unwrapped model parameters
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                policy.module.parameters()
+                if isinstance(policy, DDP)
+                else policy.parameters(),
+                grad_clip_norm,
+            )
     else:
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            policy.parameters(), float("inf"), error_if_nonfinite=False
-        )
+        # Compute grad norm even if not clipping
+        if accelerator is not None:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                policy.parameters(), float("inf"), error_if_nonfinite=False
+            )
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                policy.module.parameters()
+                if isinstance(policy, DDP)
+                else policy.parameters(),
+                float("inf"),
+                error_if_nonfinite=False,
+            )
 
     # Optimizer step
     with lock if lock is not None else nullcontext():
         optimizer.step()
-
     optimizer.zero_grad()
 
     # Step through pytorch scheduler at every batch instead of epoch
@@ -521,38 +520,31 @@ def update_policy(
         lr_scheduler.step()
 
     # Update internal buffers if policy has update method
-    if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
-        accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
+    # Get the unwrapped model for both Accelerator and DDP
+    if accelerator is not None:
+        policy_model = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+    else:
+        policy_model = policy.module if isinstance(policy, DDP) else policy
+
+    if has_method(policy_model, "update"):
+        policy_model.update()
 
     train_metrics.loss = loss.item()
     train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
+
     return train_metrics, output_dict
 
 
-"""
-1. optimizer/scheduler setup without presets
-
-TODO:
-1. organize configs into different parts like lerobot does
-others:
-1. resume
-"""
-
-
-def main(config):
-    import debugpy
-    import os
-
+def main(config: argparse.Namespace):
     # Accelerator or DDP, only for debugging purposes
-    use_accelerator = True  # config.use_accelerator
+    use_accelerator = config.use_accelerator
     accelerator = None
 
     set_seed(config.seed)
 
     if use_accelerator:
-        # Use Accelerator like lerobot does
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
         accelerator = Accelerator(
             step_scheduler_with_optimizer=False, kwargs_handlers=[ddp_kwargs]
@@ -561,71 +553,84 @@ def main(config):
         rank = accelerator.process_index
         is_main_process = accelerator.is_main_process
     else:
-        # Manual DDP setup
-        local_rank = init_ddp(config)
+        local_rank = init_ddp()
         device = torch.device("cuda", local_rank)
         rank = dist.get_rank()
         is_main_process = rank == 0 and local_rank == 0
 
-    # if is_main_process:
-    #     (
-    #         debugpy.listen(("0.0.0.0", 9096)),
-    #         debugpy.wait_for_client(),
-    #         debugpy.breakpoint(),
-    #     ) if not debugpy.is_client_connected() else None
+    model_variant = config.model_variant.lower()
+    if model_variant not in ["pi0", "pi0.5"]:
+        raise ValueError(
+            f"Invalid model_variant: {model_variant}. Must be 'pi0' or 'pi0.5'"
+        )
 
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
+    if model_variant == "pi0.5":
+        policy_config = PI05Config.from_pretrained(config.checkpoint_dir)
+    else:
+        policy_config = PI0Config.from_pretrained(config.checkpoint_dir)
+
+    # Manually set the required configs
+    policy_config.pretrained_path = config.checkpoint_dir
+    policy_config.device = device
+    policy_config.n_action_steps = config.action_steps
+    policy_config.tokenizer_max_length = config.tokenizer_max_length
 
     if is_main_process:
-        logger.info(f"Running on: {platform.node()}")
-        logger.info(f"config: {config}")
-        # if config.batch_size % torch.cuda.device_count() != 0:
-        #     raise ValueError(
-        #         f"Batch size {config.batch_size} must be divisible by the number of devices {torch.cuda.device_count()}."
-        #     )
-        logger.info(f"use_accelerator: {use_accelerator}")
-        resuming = config.resume
-        init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+        logger.info(f"Policy config ({model_variant}): {policy_config}")
 
-    pi05_config = PI05Config.from_pretrained(config.checkpoint_dir)
-    # TODO(yupu): Ugly
-    pi05_config.pretrained_path = config.checkpoint_dir
-    pi05_config.device = device
-    print(f"pi05_config: {pi05_config}")
-
-    if (use_accelerator and is_main_process) or not use_accelerator:
-        # Each process needs its own dataset for DDP training
-        dataset = make_dataset(config, pi05_config)
-
-    if use_accelerator and not is_main_process:
-        dataset = make_dataset(config, pi05_config)
+    dataset = make_dataset(config, policy_config)
 
     if use_accelerator:
         accelerator.wait_for_everyone()
+    else:
+        dist.barrier()
+
+    # TODO: (yupu) This is so ugly
+    rename_map = None
+    if config.rename_map:
+        rename_map_str = config.rename_map
+        # Clean up the rename map string, remove outer quotes if present
+        if (rename_map_str.startswith("'") and rename_map_str.endswith("'")) or (
+            rename_map_str.startswith('"') and rename_map_str.endswith('"')
+        ):
+            rename_map_str = rename_map_str[1:-1]
+            print(f"rename_map_str: {rename_map_str}")
+
+        try:
+            rename_map = json.loads(rename_map_str)
+            if not isinstance(rename_map, dict):
+                raise ValueError(
+                    f"rename_map must be a dictionary, got {type(rename_map)}"
+                )
+        except json.JSONDecodeError as e:
+            raise ValueError("Invalid JSON in --rename-map") from e
 
     policy = make_policy(
-        cfg=pi05_config,
+        cfg=policy_config,
         ds_meta=dataset.meta,
-        rename_map=None,
+        rename_map=rename_map,
+        model_variant=model_variant,
     )
-
-    # policy.eval()
-    # batch = torch.load(f"batch_after_preprocessor_0_{accelerator.process_index}.pt")
-    # with torch.no_grad():
-    #     loss, output_dict = policy.forward(batch)
-    # logger.info(f"loss: {loss.item()}")
-    # import sys
-    # sys.exit()
 
     if use_accelerator:
         accelerator.wait_for_everyone()
+    else:
+        dist.barrier()
 
     # Create processors - only provide dataset_stats if not resuming from saved processors
     processor_kwargs = {}
     postprocessor_kwargs = {}
     # Only provide dataset_stats when not resuming from saved processor state
     processor_kwargs["dataset_stats"] = dataset.meta.stats
+
+    if not config.use_quantiles and model_variant == "pi0.5":
+        from flagscale.models.configs.types import NormalizationMode
+
+        policy.config.normalization_mapping = {
+            "VISUAL": NormalizationMode.IDENTITY,
+            "STATE": NormalizationMode.MEAN_STD,
+            "ACTION": NormalizationMode.MEAN_STD,
+        }
 
     processor_kwargs["preprocessor_overrides"] = {
         "device_processor": {"device": device.type},
@@ -637,13 +642,7 @@ def main(config):
             },
             "norm_map": policy.config.normalization_mapping,
         },
-    }
-
-    # TODO(yupu): Hard-coded rename map
-    rename_map = {
-        "observation.images.cam_high": "observation.images.base_0_rgb",
-        "observation.images.cam_left_wrist": "observation.images.left_wrist_0_rgb",
-        "observation.images.cam_right_wrist": "observation.images.right_wrist_0_rgb",
+        "tokenizer_processor": {"tokenizer_name": config.tokenizer_path},
     }
 
     processor_kwargs["preprocessor_overrides"]["rename_observations_processor"] = {
@@ -657,35 +656,39 @@ def main(config):
         },
     }
 
-    preprocessor, postprocessor = make_pre_post_processors(
-        policy_cfg=pi05_config,
-        pretrained_path=pi05_config.pretrained_path,
+    if is_main_process:
+        logger.info(f"processor_kwargs: {processor_kwargs}")
+        logger.info(f"postprocessor_kwargs: {postprocessor_kwargs}")
+
+    preprocessor, _ = make_pre_post_processors(
+        pretrained_path=policy_config.pretrained_path,
         **processor_kwargs,
         **postprocessor_kwargs,
     )
 
-    # TODO(yupu): to config
+    # Convert optimizer_betas to tuple if it's a list
+    if isinstance(config.optimizer_betas, list):
+        config.optimizer_betas = tuple(config.optimizer_betas)
+
+    # TODO: (yupu) Should we let the user choose between config and policy preset?
     optimizer = torch.optim.AdamW(
         policy.parameters(),
-        lr=pi05_config.optimizer_lr,
-        betas=pi05_config.optimizer_betas,
-        eps=pi05_config.optimizer_eps,
-        weight_decay=pi05_config.optimizer_weight_decay,
+        lr=config.optimizer_lr,
+        betas=config.optimizer_betas,
+        eps=config.optimizer_eps,
+        weight_decay=config.optimizer_weight_decay,
     )
     scheduler_config = CosineDecayWithWarmupSchedulerConfig(
-        num_warmup_steps=pi05_config.scheduler_warmup_steps,
-        num_decay_steps=pi05_config.scheduler_decay_steps,
-        peak_lr=pi05_config.optimizer_lr,
-        decay_lr=pi05_config.scheduler_decay_lr,
+        num_warmup_steps=config.scheduler_warmup_steps,
+        num_decay_steps=config.scheduler_decay_steps,
+        peak_lr=config.optimizer_lr,
+        decay_lr=config.scheduler_decay_lr,
     )
     lr_scheduler = scheduler_config.build(optimizer, config.train_steps)
 
-    # Note for actual training later: You'll want shuffle=True and call sampler.set_epoch(epoch) at the start of each epoch to ensure different shuffling per epoch.
-    # TODO(yupu): to config
     config.num_workers = 4
-    shuffle = False  # Set to False for reproducible comparison
+    shuffle = config.shuffle
 
-    # TODO(yupu): drop last?
     if not use_accelerator:
         # DistributedSampler ensures each rank gets different data
         sampler = torch.utils.data.distributed.DistributedSampler(
@@ -711,7 +714,7 @@ def main(config):
             dataset,
             num_workers=config.num_workers,
             batch_size=config.batch_size,
-            shuffle=False,  # Must be False when using sampler
+            shuffle=shuffle,
             sampler=None,
             pin_memory=True,  # Assume all data is on GPU
             drop_last=False,
@@ -723,6 +726,15 @@ def main(config):
         policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
             policy, optimizer, dataloader, lr_scheduler
         )
+    else:
+        policy = DDP(
+            policy,
+            device_ids=[local_rank],
+            find_unused_parameters=True,
+            output_device=local_rank,
+        )
+        dist.barrier()
+
     dl_iter = cycle(dataloader)
 
     policy.train()
@@ -741,7 +753,7 @@ def main(config):
     else:
         effective_batch_size = config.batch_size * dist.get_world_size()
 
-    step = 0  # number of policy updates (forward + backward + optim)
+    step = 0
 
     train_tracker = MetricsTracker(
         effective_batch_size,
@@ -752,19 +764,12 @@ def main(config):
         accelerator=accelerator,
     )
 
-    # TODO(yupu): to config
-    grad_clip_norm = 1.0
-
-    if is_main_process:
-        dump_runtime(
-            config=config,
-            pi05_config=pi05_config,
-            processor_kwargs=processor_kwargs,
-            postprocessor_kwargs=postprocessor_kwargs,
-            optimizer=optimizer,
-            lr_scheduler=lr_scheduler,
-            device=device,
-        )
+    # To ensures proper data shuffling across epochs in distributed training
+    epoch = 0
+    samples_per_epoch = None
+    if not use_accelerator:
+        dataloader.sampler.set_epoch(epoch)
+        samples_per_epoch = len(dataset) // effective_batch_size
 
     for _ in range(step, config.train_steps):
         start_time = time.perf_counter()
@@ -779,13 +784,12 @@ def main(config):
         batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
-        # TODO(yupu): Remove accelerator from here
         train_tracker, output_dict = update_policy(
             train_tracker,
             policy,
             batch,
             optimizer,
-            grad_clip_norm,
+            config.grad_clip_norm,
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
         )
@@ -795,11 +799,23 @@ def main(config):
         step += 1
         train_tracker.step()
 
+        # Update epoch counter for sampler.set_epoch() when we've processed one epoch worth of samples
+        # This ensures proper data shuffling across epochs in distributed training
+        if not use_accelerator:
+            if step % samples_per_epoch == 0:
+                epoch += 1
+                dataloader.sampler.set_epoch(epoch)
+
         if step % config.log_freq == 0 and is_main_process:
-            continue
-            # logger.info(f"step: {step} loss: {train_tracker}")
+            logger.info(f"step: {step} loss: {train_tracker}")
 
         if config.save_checkpoint and step % config.save_freq == 0:
+            # Synchronize all processes before checkpoint saving
+            if use_accelerator:
+                accelerator.wait_for_everyone()
+            else:
+                dist.barrier()
+
             if is_main_process:
                 logger.info(f"Saving checkpoint at step {step}")
                 output_dir = Path(config.output_directory)
@@ -817,129 +833,101 @@ def main(config):
                 )
                 update_last_checkpoint(checkpoint_dir)
 
+            # Synchronize all processes after checkpoint saving
             if use_accelerator:
                 accelerator.wait_for_everyone()
-
-        # if use_accelerator:
-        #     torch.save(
-        #         batch, f"batch_after_preprocessor_{step}_{accelerator.process_index}.pt"
-        #     )
-        # else:
-        #     torch.save(batch, f"batch_after_preprocessor_{step}_{dist.get_rank()}.pt")
+            else:
+                dist.barrier()
 
     if is_main_process:
         logger.info("Training completed")
 
+    # Properly clean up the distributed process group
     if use_accelerator:
-        # Properly clean up the distributed process group
         accelerator.wait_for_everyone()
         accelerator.end_training()
-
-    print("done for now")
-    import sys
-
-    sys.exit()
-
-    # ds = get_train_dataset(
-    #     config.data_path,
-    #     batch_size=config.batch_size,
-    #     shuffle_buffer_size=10000,
-    #     max_samples_per_sequence=100,
-    #     worker_config=WorkerConfig.default_worker_config(
-    #         num_workers=1, data_parallel_group=None
-    #     ),
-    #     task_encoder=TaskEncoder(config),
-    #     repeat=True,
-    # )
-    # loader = get_loader(ds)
-    data_iter = None  # iter(loader)
-
-    model_config = PI0PolicyConfig.from_pretrained(config.checkpoint_dir)
-    model_config.n_action_steps = config.action_steps
-    model_config.tokenizer_max_length = config.tokenizer_max_length
-    policy = PI0Policy.from_pretrained(
-        model_path=config.checkpoint_dir,
-        tokenizer_path=config.tokenizer_path,
-        stat_path=config.stat_path,
-        config=model_config,
-    )
-    policy = policy.cuda()
-    policy = DDP(
-        policy, device_ids=[int(os.environ["LOCAL_RANK"])], find_unused_parameters=True
-    )
-    optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
-    step = 0
-    done = False
-    while not done:
-        # sampler.set_epoch(epoch)  # Uncomment when using DistributedSampler
-        batch = next(data_iter)
-        batch = {
-            k: (v.to(device) if isinstance(v, torch.Tensor) else v)
-            for k, v in batch.items()
-        }
-
-        for k, v in batch.items():
-            if isinstance(v, torch.Tensor):
-                print(f"{k}: {v.shape}")
-
-        loss, _ = policy.forward(batch)
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
-        if step % config.log_freq == 0:
-            logger.info(f"step: {step} loss: {loss.item():.3f}")
-        step += 1
-        if step >= config.train_steps:
-            done = True
-            break
-    if dist.get_rank() == 0 and local_rank == 0:
-        policy.module.save_pretrained(config.output_directory)
+    else:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint-dir", type=str, default="checkpoint_path_not_set")
-    parser.add_argument("--project-name", type=str, default="default_project")
-    parser.add_argument("--exp-name", type=str, default="default_exp")
-    parser.add_argument("--data-path", type=str, default="energon data_path not set")
-    parser.add_argument("--tokenizer-path", type=str, default="tokenizer_path not set")
-    parser.add_argument("--state-key", type=str, default="state_key not set")
-    parser.add_argument("--action-key", type=str, default="action_key not set")
-    parser.add_argument(
-        "--action-token-key", type=str, default="action_token_key not set"
-    )
-    parser.add_argument("--stat-path", type=str, default="stat_path not set")
-    parser.add_argument(
-        "--output-directory", type=str, default="output_directory not set"
-    )
-    parser.add_argument("--vision-root", type=str, default="")
 
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--tensor-model-parallel-size", type=int, default=1)
-    parser.add_argument("--pipeline-model-parallel-size", type=int, default=1)
-    parser.add_argument("--context-parallel-size", type=int, default=1)
-    parser.add_argument("--train-steps", type=int, default=10000)
-    parser.add_argument("--log-freq", type=int, default=100)
-    parser.add_argument("--action-horizon", type=int, default=30)
-    parser.add_argument("--action-steps", type=int, default=50)
-    parser.add_argument("--tokenizer-max-length", type=int, default=256)
-
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--ckpt-overwrite", action="store_true")
-    parser.add_argument("--wandb-enabled", action="store_true")
+    # ============================== System Configs ==============================
     parser.add_argument(
         "--use-accelerator",
         action="store_true",
-        help="Use HuggingFace Accelerator (like lerobot) instead of manual DDP",
+        default=False,
+        help="Whether to use HuggingFace Accelerator (like lerobot) or manual DDP",
     )
-    parser.add_argument("--cli-overrides", type=str, default="")
-    parser.add_argument("--repo-id", type=str, default="")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--train-steps", type=int, default=100000)
+    parser.add_argument("--log-freq", type=int, default=10)
+    parser.add_argument(
+        "--output-directory", type=str, default="", help="Path to the output directory"
+    )
     parser.add_argument("--save-checkpoint", action="store_true")
     parser.add_argument("--save-freq", type=int, default=1000)
+    parser.add_argument("--optimizer-lr", type=float, default=2.5e-5)
+    parser.add_argument("--optimizer-betas", nargs=2, type=float, default=[0.9, 0.95])
+    parser.add_argument("--optimizer-eps", type=float, default=1e-8)
+    parser.add_argument("--optimizer-weight-decay", type=float, default=0.01)
+    parser.add_argument("--optimizer-grad-clip-norm", type=float, default=1.0)
+    parser.add_argument("--scheduler-warmup-steps", type=int, default=1000)
+    parser.add_argument("--scheduler-decay-steps", type=int, default=30000)
+    parser.add_argument("--scheduler-decay-lr", type=float, default=2.5e-6)
+    parser.add_argument("--grad-clip-norm", type=float, default=1.0)
+    parser.add_argument("--shuffle", action="store_true")
+    parser.add_argument("--tensor-model-parallel-size", type=int, default=1)
+    parser.add_argument("--pipeline-model-parallel-size", type=int, default=1)
+    parser.add_argument("--context-parallel-size", type=int, default=1)
+    parser.add_argument("--wandb-enabled", action="store_true")
+    parser.add_argument("--project-name", type=str, default="default_project")
+    parser.add_argument("--exp-name", type=str, default="default_exp")
+
+    # ============================== Model Configs ==============================
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default="",
+        help="Path to the pretrained model checkpoint directory",
+    )
+    parser.add_argument(
+        "--model-variant",
+        type=str,
+        default="pi0",
+        choices=["pi0", "pi0.5"],
+        help="Model variant to use: 'pi0' or 'pi0.5'",
+    )
+    parser.add_argument(
+        "--tokenizer-path", type=str, default="", help="Path to the tokenizer"
+    )
+    parser.add_argument("--tokenizer-max-length", type=int, default=48)
+    parser.add_argument("--action-steps", type=int, default=50)
+
+    # ============================== Data Configs ==============================
+    parser.add_argument("--enable-image-transform", action="store_true")
+    parser.add_argument("--tolerance-s", type=float, default=0.0001)
+    parser.add_argument("--use-imagenet-stats", action="store_true")
+    parser.add_argument("--video-backend", type=str, default="pyav")
+    parser.add_argument(
+        "--data-path", type=str, default="", help="Path to the training dataset"
+    )
+    parser.add_argument(
+        "--rename-map",
+        type=str,
+        default="",
+        help=(
+            "JSON string mapping dataset feature keys to policy feature keys, "
+            'e.g., \'{"observation.images.cam_high": "observation.images.base_0_rgb"}\''
+        ),
+    )
+    parser.add_argument("--use-quantiles", action="store_true")
 
     config = parser.parse_args()
 
     logger.info("=" * 100)
-    logger.info(f"train_pi0_5_base.py config: {config}")
+    logger.info(f"train_pi0_base.py config: {config}")
     main(config)

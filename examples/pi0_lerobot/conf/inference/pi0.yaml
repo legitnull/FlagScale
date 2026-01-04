@@ -1,0 +1,22 @@
+engine:
+  # Model variant: "pi0" or "pi0.5"
+  model_variant: "pi0"
+  model: /share/project/fengyupu/hf_hub/pi0_base
+  tokenizer: /share/project/fengyupu/hf_hub/paligemma-3b-pt-224
+  # TODO: (yupu) Use the stat safetensors
+  stat_path: /share/project/fengyupu/hf_hub/aloha_mobile_cabinet/meta/stats.json
+  device: "cuda"
+
+generate:
+  images:
+    observation.images.cam_high: /share/project/fengyupu/github/FlagScale/inference_inputs/frame_10_observation_images_cam_high.jpg
+    observation.images.cam_left_wrist: /share/project/fengyupu/github/FlagScale/inference_inputs/frame_10_observation_images_cam_left_wrist.jpg
+    observation.images.cam_right_wrist: /share/project/fengyupu/github/FlagScale/inference_inputs/frame_10_observation_images_cam_right_wrist.jpg
+  state_path: /share/project/fengyupu/github/FlagScale/inference_inputs/frame_10_state.pt
+  task_path: /share/project/fengyupu/github/FlagScale/inference_inputs/frame_10_task.txt
+  # Optional rename_map to map input keys to policy expected keys
+  rename_map:
+    observation.images.cam_high: observation.images.base_0_rgb
+    observation.images.cam_left_wrist: observation.images.left_wrist_0_rgb
+    observation.images.cam_right_wrist: observation.images.right_wrist_0_rgb
+

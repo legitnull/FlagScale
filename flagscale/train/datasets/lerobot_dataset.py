@@ -26,14 +26,15 @@ import numpy as np
 import packaging.version
 import pandas as pd
 import PIL.Image
-import pyarrow as pa
-import pyarrow.parquet as pq
 import torch
 import torch.utils
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.errors import RevisionNotFoundError
 
-from flagscale.train.datasets.compute_stats import aggregate_stats, compute_episode_stats
+from flagscale.train.datasets.compute_stats import (
+    aggregate_stats,
+    compute_episode_stats,
+)
 from flagscale.train.datasets.image_writer import AsyncImageWriter, write_image
 from flagscale.train.datasets.utils import (
     DEFAULT_EPISODES_PATH,
@@ -83,15 +84,15 @@ CODEBASE_VERSION = "v3.0"
 class LeRobotDatasetMetadata:
     def __init__(
         self,
-        repo_id: str,
+        # repo_id: str,
         root: str | Path | None = None,
         revision: str | None = None,
         force_cache_sync: bool = False,
         metadata_buffer_size: int = 10,
     ):
-        self.repo_id = repo_id
+        # self.repo_id = repo_id
         self.revision = revision if revision else CODEBASE_VERSION
-        self.root = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
+        self.root = Path(root)  # if root is not None else HF_LEROBOT_HOME / repo_id
         self.writer = None
         self.latest_episode = None
         self.metadata_buffer: list[dict] = []
@@ -102,12 +103,13 @@ class LeRobotDatasetMetadata:
                 raise FileNotFoundError
             self.load_metadata()
         except (FileNotFoundError, NotADirectoryError):
-            if is_valid_version(self.revision):
-                self.revision = get_safe_version(self.repo_id, self.revision)
+            raise FileNotFoundError(f"Root directory {self.root} does not exist.")
+            # if is_valid_version(self.revision):
+            #     self.revision = get_safe_version(self.repo_id, self.revision)
 
-            (self.root / "meta").mkdir(exist_ok=True, parents=True)
-            self.pull_from_repo(allow_patterns="meta/")
-            self.load_metadata()
+            # (self.root / "meta").mkdir(exist_ok=True, parents=True)
+            # self.pull_from_repo(allow_patterns="meta/")
+            # self.load_metadata()
 
     def _flush_metadata_buffer(self) -> None:
         """Write all buffered episode metadata to parquet file."""
@@ -122,16 +124,27 @@ class LeRobotDatasetMetadata:
                 # Extract value and serialize numpy arrays
                 # because PyArrow's from_pydict function doesn't support numpy arrays
                 val = value[0] if isinstance(value, list) else value
-                combined_dict[key].append(val.tolist() if isinstance(val, np.ndarray) else val)
+                combined_dict[key].append(
+                    val.tolist() if isinstance(val, np.ndarray) else val
+                )
 
         first_ep = self.metadata_buffer[0]
         chunk_idx = first_ep["meta/episodes/chunk_index"][0]
         file_idx = first_ep["meta/episodes/file_index"][0]
 
+        # Lazy import: only needed for writing datasets
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
         table = pa.Table.from_pydict(combined_dict)
 
         if not self.writer:
-            path = Path(self.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx))
+            path = Path(
+                self.root
+                / DEFAULT_EPISODES_PATH.format(
+                    chunk_index=chunk_idx, file_index=file_idx
+                )
+            )
             path.parent.mkdir(parents=True, exist_ok=True)
             self.writer = pq.ParquetWriter(
                 path, schema=table.schema, compression="snappy", use_dictionary=True
@@ -159,7 +172,7 @@ class LeRobotDatasetMetadata:
 
     def load_metadata(self):
         self.info = load_info(self.root)
-        check_version_compatibility(self.repo_id, self._version, CODEBASE_VERSION)
+        # check_version_compatibility(self.repo_id, self._version, CODEBASE_VERSION)
         self.tasks = load_tasks(self.root)
         self.episodes = load_episodes(self.root)
         self.stats = load_stats(self.root)
@@ -210,7 +223,9 @@ class LeRobotDatasetMetadata:
         ep = self.episodes[ep_index]
         chunk_idx = ep[f"videos/{vid_key}/chunk_index"]
         file_idx = ep[f"videos/{vid_key}/file_index"]
-        fpath = self.video_path.format(video_key=vid_key, chunk_index=chunk_idx, file_index=file_idx)
+        fpath = self.video_path.format(
+            video_key=vid_key, chunk_index=chunk_idx, file_index=file_idx
+        )
         return Path(fpath)
 
     @property
@@ -251,7 +266,11 @@ class LeRobotDatasetMetadata:
     @property
     def camera_keys(self) -> list[str]:
         """Keys to access visual modalities (regardless of their storage method)."""
-        return [key for key, ft in self.features.items() if ft["dtype"] in ["video", "image"]]
+        return [
+            key
+            for key, ft in self.features.items()
+            if ft["dtype"] in ["video", "image"]
+        ]
 
     @property
     def names(self) -> dict[str, list | dict]:
@@ -350,7 +369,9 @@ class LeRobotDatasetMetadata:
                 episode_dict["dataset_to_index"] = [latest_num_frames + num_frames]
 
                 # When resuming, move to the next file
-                chunk_idx, file_idx = update_chunk_file_indices(chunk_idx, file_idx, self.chunks_size)
+                chunk_idx, file_idx = update_chunk_file_indices(
+                    chunk_idx, file_idx, self.chunks_size
+                )
             else:
                 episode_dict["dataset_from_index"] = [0]
                 episode_dict["dataset_to_index"] = [num_frames]
@@ -362,7 +383,10 @@ class LeRobotDatasetMetadata:
             file_idx = self.latest_episode["meta/episodes/file_index"][0]
 
             latest_path = (
-                self.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
+                self.root
+                / DEFAULT_EPISODES_PATH.format(
+                    chunk_index=chunk_idx, file_index=file_idx
+                )
                 if self.writer is None
                 else self.writer.where
             )
@@ -371,19 +395,32 @@ class LeRobotDatasetMetadata:
                 latest_size_in_mb = get_file_size_in_mb(Path(latest_path))
                 latest_num_frames = self.latest_episode["episode_index"][0]
 
-                av_size_per_frame = latest_size_in_mb / latest_num_frames if latest_num_frames > 0 else 0.0
+                av_size_per_frame = (
+                    latest_size_in_mb / latest_num_frames
+                    if latest_num_frames > 0
+                    else 0.0
+                )
 
-                if latest_size_in_mb + av_size_per_frame * num_frames >= self.data_files_size_in_mb:
+                if (
+                    latest_size_in_mb + av_size_per_frame * num_frames
+                    >= self.data_files_size_in_mb
+                ):
                     # Size limit is reached, flush buffer and prepare new parquet file
                     self._flush_metadata_buffer()
-                    chunk_idx, file_idx = update_chunk_file_indices(chunk_idx, file_idx, self.chunks_size)
+                    chunk_idx, file_idx = update_chunk_file_indices(
+                        chunk_idx, file_idx, self.chunks_size
+                    )
                     self._close_writer()
 
             # Update the existing pandas dataframe with new row
             episode_dict["meta/episodes/chunk_index"] = [chunk_idx]
             episode_dict["meta/episodes/file_index"] = [file_idx]
-            episode_dict["dataset_from_index"] = [self.latest_episode["dataset_to_index"][0]]
-            episode_dict["dataset_to_index"] = [self.latest_episode["dataset_to_index"][0] + num_frames]
+            episode_dict["dataset_from_index"] = [
+                self.latest_episode["dataset_to_index"][0]
+            ]
+            episode_dict["dataset_to_index"] = [
+                self.latest_episode["dataset_to_index"][0] + num_frames
+            ]
 
         # Add to buffer
         self.metadata_buffer.append(episode_dict)
@@ -417,7 +454,11 @@ class LeRobotDatasetMetadata:
 
         write_info(self.info, self.root)
 
-        self.stats = aggregate_stats([self.stats, episode_stats]) if self.stats is not None else episode_stats
+        self.stats = (
+            aggregate_stats([self.stats, episode_stats])
+            if self.stats is not None
+            else episode_stats
+        )
         write_stats(self.stats, self.root)
 
     def update_video_info(self, video_key: str | None = None) -> None:
@@ -431,7 +472,9 @@ class LeRobotDatasetMetadata:
         video_keys = [video_key] if video_key is not None else self.video_keys
         for key in video_keys:
             if not self.features[key].get("info", None):
-                video_path = self.root / self.video_path.format(video_key=key, chunk_index=0, file_index=0)
+                video_path = self.root / self.video_path.format(
+                    video_key=key, chunk_index=0, file_index=0
+                )
                 self.info["features"][key]["info"] = get_video_info(video_path)
 
     def update_chunk_settings(
@@ -458,12 +501,16 @@ class LeRobotDatasetMetadata:
 
         if data_files_size_in_mb is not None:
             if data_files_size_in_mb <= 0:
-                raise ValueError(f"data_files_size_in_mb must be positive, got {data_files_size_in_mb}")
+                raise ValueError(
+                    f"data_files_size_in_mb must be positive, got {data_files_size_in_mb}"
+                )
             self.info["data_files_size_in_mb"] = data_files_size_in_mb
 
         if video_files_size_in_mb is not None:
             if video_files_size_in_mb <= 0:
-                raise ValueError(f"video_files_size_in_mb must be positive, got {video_files_size_in_mb}")
+                raise ValueError(
+                    f"video_files_size_in_mb must be positive, got {video_files_size_in_mb}"
+                )
             self.info["video_files_size_in_mb"] = video_files_size_in_mb
 
         # Update the info file on disk
@@ -540,9 +587,15 @@ class LeRobotDatasetMetadata:
         return obj
 
 
-def _encode_video_worker(video_key: str, episode_index: int, root: Path, fps: int) -> Path:
-    temp_path = Path(tempfile.mkdtemp(dir=root)) / f"{video_key}_{episode_index:03d}.mp4"
-    fpath = DEFAULT_IMAGE_PATH.format(image_key=video_key, episode_index=episode_index, frame_index=0)
+def _encode_video_worker(
+    video_key: str, episode_index: int, root: Path, fps: int
+) -> Path:
+    temp_path = (
+        Path(tempfile.mkdtemp(dir=root)) / f"{video_key}_{episode_index:03d}.mp4"
+    )
+    fpath = DEFAULT_IMAGE_PATH.format(
+        image_key=video_key, episode_index=episode_index, frame_index=0
+    )
     img_dir = (root / fpath).parent
     encode_video_frames(img_dir, temp_path, fps, overwrite=True)
     shutil.rmtree(img_dir)
@@ -552,7 +605,7 @@ def _encode_video_worker(video_key: str, episode_index: int, root: Path, fps: in
 class LeRobotDataset(torch.utils.data.Dataset):
     def __init__(
         self,
-        repo_id: str,
+        # repo_id: str,
         root: str | Path | None = None,
         episodes: list[int] | None = None,
         image_transforms: Callable | None = None,
@@ -677,14 +730,16 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 Set to 1 for immediate encoding (default), or higher for batched encoding. Defaults to 1.
         """
         super().__init__()
-        self.repo_id = repo_id
-        self.root = Path(root) if root else HF_LEROBOT_HOME / repo_id
+        # self.repo_id = repo_id
+        self.root = Path(root)  # if root else HF_LEROBOT_HOME / repo_id
         self.image_transforms = image_transforms
         self.delta_timestamps = delta_timestamps
         self.episodes = episodes
         self.tolerance_s = tolerance_s
         self.revision = revision if revision else CODEBASE_VERSION
-        self.video_backend = video_backend if video_backend else get_safe_default_codec()
+        self.video_backend = (
+            video_backend if video_backend else get_safe_default_codec()
+        )
         self.delta_indices = None
         self.batch_encoding_size = batch_encoding_size
         self.episodes_since_last_encoding = 0
@@ -694,13 +749,15 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.episode_buffer = None
         self.writer = None
         self.latest_episode = None
-        self._current_file_start_frame = None  # Track the starting frame index of the current parquet file
+        self._current_file_start_frame = (
+            None  # Track the starting frame index of the current parquet file
+        )
 
         self.root.mkdir(exist_ok=True, parents=True)
 
         # Load metadata
         self.meta = LeRobotDatasetMetadata(
-            self.repo_id, self.root, self.revision, force_cache_sync=force_cache_sync
+            self.root, self.revision, force_cache_sync=force_cache_sync
         )
 
         # Track dataset state for efficient incremental writing
@@ -715,19 +772,24 @@ class LeRobotDataset(torch.utils.data.Dataset):
             self.hf_dataset = self.load_hf_dataset()
             # Check if cached dataset contains all requested episodes
             if not self._check_cached_episodes_sufficient():
-                raise FileNotFoundError("Cached dataset doesn't contain all requested episodes")
+                raise FileNotFoundError(
+                    "Cached dataset doesn't contain all requested episodes"
+                )
         except (AssertionError, FileNotFoundError, NotADirectoryError):
-            if is_valid_version(self.revision):
-                self.revision = get_safe_version(self.repo_id, self.revision)
-            self.download(download_videos)
-            self.hf_dataset = self.load_hf_dataset()
+            raise FileNotFoundError(f"Root directory {self.root} does not exist.")
+            # if is_valid_version(self.revision):
+            #     self.revision = get_safe_version(self.repo_id, self.revision)
+            # self.download(download_videos)
+            # self.hf_dataset = self.load_hf_dataset()
 
         # Create mapping from absolute indices to relative indices when only a subset of the episodes are loaded
         # Build a mapping: absolute_index -> relative_index_in_filtered_dataset
         self._absolute_to_relative_idx = None
         if self.episodes is not None:
             self._absolute_to_relative_idx = {
-                abs_idx.item() if isinstance(abs_idx, torch.Tensor) else abs_idx: rel_idx
+                abs_idx.item()
+                if isinstance(abs_idx, torch.Tensor)
+                else abs_idx: rel_idx
                 for rel_idx, abs_idx in enumerate(self.hf_dataset["index"])
             }
 
@@ -801,8 +863,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         if tag_version:
             with contextlib.suppress(RevisionNotFoundError):
-                hub_api.delete_tag(self.repo_id, tag=CODEBASE_VERSION, repo_type="dataset")
-            hub_api.create_tag(self.repo_id, tag=CODEBASE_VERSION, revision=branch, repo_type="dataset")
+                hub_api.delete_tag(
+                    self.repo_id, tag=CODEBASE_VERSION, repo_type="dataset"
+                )
+            hub_api.create_tag(
+                self.repo_id, tag=CODEBASE_VERSION, revision=branch, repo_type="dataset"
+            )
 
     def pull_from_repo(
         self,
@@ -833,7 +899,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.pull_from_repo(allow_patterns=files, ignore_patterns=ignore_patterns)
 
     def get_episodes_file_paths(self) -> list[Path]:
-        episodes = self.episodes if self.episodes is not None else list(range(self.meta.total_episodes))
+        episodes = (
+            self.episodes
+            if self.episodes is not None
+            else list(range(self.meta.total_episodes))
+        )
         fpaths = [str(self.meta.get_data_file_path(ep_idx)) for ep_idx in episodes]
         if len(self.meta.video_keys) > 0:
             video_files = [
@@ -849,7 +919,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
     def load_hf_dataset(self) -> datasets.Dataset:
         """hf_dataset contains all the observations, states, actions, rewards, etc."""
         features = get_hf_features_from_features(self.features)
-        hf_dataset = load_nested_dataset(self.root / "data", features=features, episodes=self.episodes)
+        hf_dataset = load_nested_dataset(
+            self.root / "data", features=features, episodes=self.episodes
+        )
         hf_dataset.set_transform(hf_transform_to_torch)
         return hf_dataset
 
@@ -878,7 +950,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if len(self.meta.video_keys) > 0:
             for ep_idx in requested_episodes:
                 for vid_key in self.meta.video_keys:
-                    video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
+                    video_path = self.root / self.meta.get_video_file_path(
+                        ep_idx, vid_key
+                    )
                     if not video_path.exists():
                         return False
 
@@ -887,7 +961,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
     def create_hf_dataset(self) -> datasets.Dataset:
         features = get_hf_features_from_features(self.features)
         ft_dict = {col: [] for col in features}
-        hf_dataset = datasets.Dataset.from_dict(ft_dict, features=features, split="train")
+        hf_dataset = datasets.Dataset.from_dict(
+            ft_dict, features=features, split="train"
+        )
         hf_dataset.set_transform(hf_transform_to_torch)
         return hf_dataset
 
@@ -911,7 +987,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
     @property
     def num_episodes(self) -> int:
         """Number of episodes selected."""
-        return len(self.episodes) if self.episodes is not None else self.meta.total_episodes
+        return (
+            len(self.episodes)
+            if self.episodes is not None
+            else self.meta.total_episodes
+        )
 
     @property
     def features(self) -> dict[str, dict]:
@@ -925,7 +1005,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         else:
             return get_hf_features_from_features(self.features)
 
-    def _get_query_indices(self, idx: int, ep_idx: int) -> tuple[dict[str, list[int | bool]]]:
+    def _get_query_indices(
+        self, idx: int, ep_idx: int
+    ) -> tuple[dict[str, list[int | bool]]]:
         ep = self.meta.episodes[ep_idx]
         ep_start = ep["dataset_from_index"]
         ep_end = ep["dataset_to_index"]
@@ -935,7 +1017,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
         }
         padding = {  # Pad values outside of current episode range
             f"{key}_is_pad": torch.BoolTensor(
-                [(idx + delta < ep_start) | (idx + delta >= ep_end) for delta in delta_idx]
+                [
+                    (idx + delta < ep_start) | (idx + delta >= ep_end)
+                    for delta in delta_idx
+                ]
             )
             for key, delta_idx in self.delta_indices.items()
         }
@@ -950,7 +1035,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
         for key in self.meta.video_keys:
             if query_indices is not None and key in query_indices:
                 if self._absolute_to_relative_idx is not None:
-                    relative_indices = [self._absolute_to_relative_idx[idx] for idx in query_indices[key]]
+                    relative_indices = [
+                        self._absolute_to_relative_idx[idx]
+                        for idx in query_indices[key]
+                    ]
                     timestamps = self.hf_dataset[relative_indices]["timestamp"]
                 else:
                     timestamps = self.hf_dataset[query_indices[key]]["timestamp"]
@@ -988,7 +1076,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 result[key] = torch.stack(self.hf_dataset[relative_indices][key])
         return result
 
-    def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
+    def _query_videos(
+        self, query_timestamps: dict[str, list[float]], ep_idx: int
+    ) -> dict[str, torch.Tensor]:
         """Note: When using data workers (e.g. DataLoader with num_workers>0), do not call this function
         in the main process (e.g. by using a second Dataloader with num_workers=0). It will result in a
         Segmentation Fault. This probably happens because a memory reference to the video loader is created in
@@ -1004,7 +1094,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
             shifted_query_ts = [from_timestamp + ts for ts in query_ts]
 
             video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
-            frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend)
+            frames = decode_video_frames(
+                video_path, shifted_query_ts, self.tolerance_s, self.video_backend
+            )
             item[vid_key] = frames.squeeze(0)
 
         return item
@@ -1072,7 +1164,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.meta._close_writer()
 
     def create_episode_buffer(self, episode_index: int | None = None) -> dict:
-        current_ep_idx = self.meta.total_episodes if episode_index is None else episode_index
+        current_ep_idx = (
+            self.meta.total_episodes if episode_index is None else episode_index
+        )
         ep_buffer = {}
         # size and task are special cases that are not in self.features
         ep_buffer["size"] = 0
@@ -1082,7 +1176,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         return ep_buffer
 
     # TODO(Steven): consider move this to utils
-    def _get_image_file_path(self, episode_index: int, image_key: str, frame_index: int) -> Path:
+    def _get_image_file_path(
+        self, episode_index: int, image_key: str, frame_index: int
+    ) -> Path:
         fpath = DEFAULT_IMAGE_PATH.format(
             image_key=image_key, episode_index=episode_index, frame_index=frame_index
         )
@@ -1092,14 +1188,19 @@ class LeRobotDataset(torch.utils.data.Dataset):
         return self._get_image_file_path(episode_index, image_key, frame_index=0).parent
 
     def _save_image(
-        self, image: torch.Tensor | np.ndarray | PIL.Image.Image, fpath: Path, compress_level: int = 1
+        self,
+        image: torch.Tensor | np.ndarray | PIL.Image.Image,
+        fpath: Path,
+        compress_level: int = 1,
     ) -> None:
         if self.image_writer is None:
             if isinstance(image, torch.Tensor):
                 image = image.cpu().numpy()
             write_image(image, fpath, compress_level=compress_level)
         else:
-            self.image_writer.save_image(image=image, fpath=fpath, compress_level=compress_level)
+            self.image_writer.save_image(
+                image=image, fpath=fpath, compress_level=compress_level
+            )
 
     def add_frame(self, frame: dict) -> None:
         """
@@ -1119,10 +1220,14 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         # Automatically add frame_index and timestamp to episode buffer
         frame_index = self.episode_buffer["size"]
-        timestamp = frame.pop("timestamp") if "timestamp" in frame else frame_index / self.fps
+        timestamp = (
+            frame.pop("timestamp") if "timestamp" in frame else frame_index / self.fps
+        )
         self.episode_buffer["frame_index"].append(frame_index)
         self.episode_buffer["timestamp"].append(timestamp)
-        self.episode_buffer["task"].append(frame.pop("task"))  # Remove task from frame after processing
+        self.episode_buffer["task"].append(
+            frame.pop("task")
+        )  # Remove task from frame after processing
 
         # Add frame features to episode_buffer
         for key in frame:
@@ -1133,7 +1238,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
             if self.features[key]["dtype"] in ["image", "video"]:
                 img_path = self._get_image_file_path(
-                    episode_index=self.episode_buffer["episode_index"], image_key=key, frame_index=frame_index
+                    episode_index=self.episode_buffer["episode_index"],
+                    image_key=key,
+                    frame_index=frame_index,
                 )
                 if frame_index == 0:
                     img_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1164,7 +1271,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
             parallel_encoding (bool, optional): If True, encode videos in parallel using ProcessPoolExecutor.
                 Defaults to True on Linux, False on macOS as it tends to use all the CPU available already.
         """
-        episode_buffer = episode_data if episode_data is not None else self.episode_buffer
+        episode_buffer = (
+            episode_data if episode_data is not None else self.episode_buffer
+        )
 
         validate_episode_buffer(episode_buffer, self.meta.total_episodes, self.features)
 
@@ -1174,19 +1283,26 @@ class LeRobotDataset(torch.utils.data.Dataset):
         episode_tasks = list(set(tasks))
         episode_index = episode_buffer["episode_index"]
 
-        episode_buffer["index"] = np.arange(self.meta.total_frames, self.meta.total_frames + episode_length)
+        episode_buffer["index"] = np.arange(
+            self.meta.total_frames, self.meta.total_frames + episode_length
+        )
         episode_buffer["episode_index"] = np.full((episode_length,), episode_index)
 
         # Update tasks and task indices with new tasks if any
         self.meta.save_episode_tasks(episode_tasks)
 
         # Given tasks in natural language, find their corresponding task indices
-        episode_buffer["task_index"] = np.array([self.meta.get_task_index(task) for task in tasks])
+        episode_buffer["task_index"] = np.array(
+            [self.meta.get_task_index(task) for task in tasks]
+        )
 
         for key, ft in self.features.items():
             # index, episode_index, task_index are already processed above, and image and video
             # are processed separately by storing image path and frame info as meta data
-            if key in ["index", "episode_index", "task_index"] or ft["dtype"] in ["image", "video"]:
+            if key in ["index", "episode_index", "task_index"] or ft["dtype"] in [
+                "image",
+                "video",
+            ]:
                 continue
             episode_buffer[key] = np.stack(episode_buffer[key])
 
@@ -1203,7 +1319,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
             if parallel_encoding and num_cameras > 1:
                 # TODO(Steven): Ideally we would like to control the number of threads per encoding such that:
                 # num_cameras * num_threads = (total_cpu -1)
-                with concurrent.futures.ProcessPoolExecutor(max_workers=num_cameras) as executor:
+                with concurrent.futures.ProcessPoolExecutor(
+                    max_workers=num_cameras
+                ) as executor:
                     future_to_key = {
                         executor.submit(
                             _encode_video_worker,
@@ -1222,20 +1340,28 @@ class LeRobotDataset(torch.utils.data.Dataset):
                             temp_path = future.result()
                             results[video_key] = temp_path
                         except Exception as exc:
-                            logging.error(f"Video encoding failed for {video_key}: {exc}")
+                            logging.error(
+                                f"Video encoding failed for {video_key}: {exc}"
+                            )
                             raise exc
 
                 for video_key in self.meta.video_keys:
                     temp_path = results[video_key]
                     ep_metadata.update(
-                        self._save_episode_video(video_key, episode_index, temp_path=temp_path)
+                        self._save_episode_video(
+                            video_key, episode_index, temp_path=temp_path
+                        )
                     )
             else:
                 for video_key in self.meta.video_keys:
-                    ep_metadata.update(self._save_episode_video(video_key, episode_index))
+                    ep_metadata.update(
+                        self._save_episode_video(video_key, episode_index)
+                    )
 
         # `meta.save_episode` need to be executed after encoding the videos
-        self.meta.save_episode(episode_index, episode_length, episode_tasks, ep_stats, ep_metadata)
+        self.meta.save_episode(
+            episode_index, episode_length, episode_tasks, ep_stats, ep_metadata
+        )
 
         if has_video_keys and use_batched_encoding:
             # Check if we should trigger batch encoding
@@ -1250,7 +1376,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
             # Reset episode buffer and clean up temporary images (if not already deleted during video encoding)
             self.clear_episode_buffer(delete_images=len(self.meta.image_keys) > 0)
 
-    def _batch_save_episode_video(self, start_episode: int, end_episode: int | None = None) -> None:
+    def _batch_save_episode_video(
+        self, start_episode: int, end_episode: int | None = None
+    ) -> None:
         """
         Batch save videos for multiple episodes.
 
@@ -1267,7 +1395,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         chunk_idx = self.meta.episodes[start_episode]["data/chunk_index"]
         file_idx = self.meta.episodes[start_episode]["data/file_index"]
-        episode_df_path = self.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
+        episode_df_path = self.root / DEFAULT_EPISODES_PATH.format(
+            chunk_index=chunk_idx, file_index=file_idx
+        )
         episode_df = pd.read_parquet(episode_df_path)
 
         for ep_idx in range(start_episode, end_episode):
@@ -1295,7 +1425,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
             for video_key in self.meta.video_keys:
                 video_ep_metadata.update(self._save_episode_video(video_key, ep_idx))
             video_ep_metadata.pop("episode_index")
-            video_ep_df = pd.DataFrame(video_ep_metadata, index=[ep_idx]).convert_dtypes(
+            video_ep_df = pd.DataFrame(
+                video_ep_metadata, index=[ep_idx]
+            ).convert_dtypes(
                 dtype_backend="pyarrow"
             )  # allows NaN values along with integers
 
@@ -1318,7 +1450,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         """
         # Convert buffer into HF Dataset
         ep_dict = {key: episode_buffer[key] for key in self.hf_features}
-        ep_dataset = datasets.Dataset.from_dict(ep_dict, features=self.hf_features, split="train")
+        ep_dataset = datasets.Dataset.from_dict(
+            ep_dict, features=self.hf_features, split="train"
+        )
         ep_dataset = embed_images(ep_dataset)
         ep_num_frames = len(ep_dataset)
 
@@ -1337,7 +1471,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 file_idx = latest_ep["data/file_index"]
 
                 # When resuming, move to the next file
-                chunk_idx, file_idx = update_chunk_file_indices(chunk_idx, file_idx, self.meta.chunks_size)
+                chunk_idx, file_idx = update_chunk_file_indices(
+                    chunk_idx, file_idx, self.meta.chunks_size
+                )
                 self._current_file_start_frame = global_frame_index
         else:
             # Retrieve information from the latest parquet file
@@ -1346,21 +1482,28 @@ class LeRobotDataset(torch.utils.data.Dataset):
             file_idx = latest_ep["data/file_index"]
             global_frame_index = latest_ep["index"][-1] + 1
 
-            latest_path = self.root / self.meta.data_path.format(chunk_index=chunk_idx, file_index=file_idx)
+            latest_path = self.root / self.meta.data_path.format(
+                chunk_index=chunk_idx, file_index=file_idx
+            )
             latest_size_in_mb = get_file_size_in_mb(latest_path)
 
             frames_in_current_file = global_frame_index - self._current_file_start_frame
             av_size_per_frame = (
-                latest_size_in_mb / frames_in_current_file if frames_in_current_file > 0 else 0
+                latest_size_in_mb / frames_in_current_file
+                if frames_in_current_file > 0
+                else 0
             )
 
             # Determine if a new parquet file is needed
             if (
-                latest_size_in_mb + av_size_per_frame * ep_num_frames >= self.meta.data_files_size_in_mb
+                latest_size_in_mb + av_size_per_frame * ep_num_frames
+                >= self.meta.data_files_size_in_mb
                 or self._writer_closed_for_reading
             ):
                 # Size limit is reached or writer was closed for reading, prepare new parquet file
-                chunk_idx, file_idx = update_chunk_file_indices(chunk_idx, file_idx, self.meta.chunks_size)
+                chunk_idx, file_idx = update_chunk_file_indices(
+                    chunk_idx, file_idx, self.meta.chunks_size
+                )
                 self._close_writer()
                 self._writer_closed_for_reading = False
                 self._current_file_start_frame = global_frame_index
@@ -1369,8 +1512,13 @@ class LeRobotDataset(torch.utils.data.Dataset):
         ep_dict["data/file_index"] = file_idx
 
         # Write the resulting dataframe from RAM to disk
-        path = self.root / self.meta.data_path.format(chunk_index=chunk_idx, file_index=file_idx)
+        path = self.root / self.meta.data_path.format(
+            chunk_index=chunk_idx, file_index=file_idx
+        )
         path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Lazy import: only needed for writing datasets
+        import pyarrow.parquet as pq
 
         table = ep_dataset.with_format("arrow")[:]
         if not self.writer:
@@ -1422,7 +1570,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
             if self.meta.episodes is not None and len(self.meta.episodes) > 0:
                 # It means we are resuming recording, so we need to load the latest episode
                 # Update the indices to avoid overwriting the latest episode
-                old_chunk_idx = self.meta.episodes[-1][f"videos/{video_key}/chunk_index"]
+                old_chunk_idx = self.meta.episodes[-1][
+                    f"videos/{video_key}/chunk_index"
+                ]
                 old_file_idx = self.meta.episodes[-1][f"videos/{video_key}/file_index"]
                 chunk_idx, file_idx = update_chunk_file_indices(
                     old_chunk_idx, old_file_idx, self.meta.chunks_size
@@ -1447,7 +1597,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
             if latest_size_in_mb + ep_size_in_mb >= self.meta.video_files_size_in_mb:
                 # Move temporary episode video to a new video file in the dataset
-                chunk_idx, file_idx = update_chunk_file_indices(chunk_idx, file_idx, self.meta.chunks_size)
+                chunk_idx, file_idx = update_chunk_file_indices(
+                    chunk_idx, file_idx, self.meta.chunks_size
+                )
                 new_path = self.root / self.meta.video_path.format(
                     video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
                 )
@@ -1467,7 +1619,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # Update video info (only needed when first episode is encoded since it reads from episode 0)
         if episode_index == 0:
             self.meta.update_video_info(video_key)
-            write_info(self.meta.info, self.meta.root)  # ensure video info always written properly
+            write_info(
+                self.meta.info, self.meta.root
+            )  # ensure video info always written properly
 
         metadata = {
             "episode_index": episode_index,
@@ -1486,7 +1640,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 self._wait_image_writer()
             episode_index = self.episode_buffer["episode_index"]
             if isinstance(episode_index, np.ndarray):
-                episode_index = episode_index.item() if episode_index.size == 1 else episode_index[0]
+                episode_index = (
+                    episode_index.item()
+                    if episode_index.size == 1
+                    else episode_index[0]
+                )
             for cam_key in self.meta.camera_keys:
                 img_dir = self._get_image_file_dir(episode_index, cam_key)
                 if img_dir.is_dir():
@@ -1520,7 +1678,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if self.image_writer is not None:
             self.image_writer.wait_until_done()
 
-    def _encode_temporary_episode_video(self, video_key: str, episode_index: int) -> Path:
+    def _encode_temporary_episode_video(
+        self, video_key: str, episode_index: int
+    ) -> Path:
         """
         Use ffmpeg to convert frames stored as png into mp4 videos.
         Note: `encode_video_frames` is a blocking call. Making it asynchronous shouldn't speedup encoding,
@@ -1573,7 +1733,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj.delta_timestamps = None
         obj.delta_indices = None
         obj._absolute_to_relative_idx = None
-        obj.video_backend = video_backend if video_backend is not None else get_safe_default_codec()
+        obj.video_backend = (
+            video_backend if video_backend is not None else get_safe_default_codec()
+        )
         obj.writer = None
         obj.latest_episode = None
         obj._current_file_start_frame = None
@@ -1605,7 +1767,9 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
         super().__init__()
         self.repo_ids = repo_ids
         self.root = Path(root) if root else HF_LEROBOT_HOME
-        self.tolerances_s = tolerances_s if tolerances_s else dict.fromkeys(repo_ids, 0.0001)
+        self.tolerances_s = (
+            tolerances_s if tolerances_s else dict.fromkeys(repo_ids, 0.0001)
+        )
         # Construct the underlying datasets passing everything but `transform` and `delta_timestamps` which
         # are handled by this class.
         self._datasets = [
@@ -1679,7 +1843,13 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
     def features(self) -> datasets.Features:
         features = {}
         for dataset in self._datasets:
-            features.update({k: v for k, v in dataset.hf_features.items() if k not in self.disabled_features})
+            features.update(
+                {
+                    k: v
+                    for k, v in dataset.hf_features.items()
+                    if k not in self.disabled_features
+                }
+            )
         return features
 
     @property
@@ -1740,7 +1910,9 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
                 continue
             break
         else:
-            raise AssertionError("We expect the loop to break out as long as the index is within bounds.")
+            raise AssertionError(
+                "We expect the loop to break out as long as the index is within bounds."
+            )
         item = self._datasets[dataset_idx][idx - start_idx]
         item["dataset_index"] = torch.tensor(dataset_idx)
         for data_key in self.disabled_features:

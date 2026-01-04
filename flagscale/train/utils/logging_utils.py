@@ -149,10 +149,20 @@ class MetricsTracker:
         """
         Updates metrics that depend on 'step' for one step.
         """
+        import torch.distributed as dist
+
         self.steps += 1
-        self.samples += self._batch_size * (
-            self.accelerator.num_processes if self.accelerator else 1
-        )
+        # Get number of processes: from accelerator or from DDP
+        if self.accelerator is not None:
+            num_processes = self.accelerator.num_processes
+        else:
+            # Try to get from DDP if available
+            try:
+                num_processes = dist.get_world_size() if dist.is_initialized() else 1
+            except:
+                num_processes = 1
+
+        self.samples += self._batch_size * num_processes
         self.episodes = self.samples / self._avg_samples_per_ep
         self.epochs = self.samples / self._num_frames
 

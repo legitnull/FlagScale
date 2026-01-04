@@ -1,0 +1,16 @@
+engine:
+  host: 0.0.0.0
+  port: 5000
+  model: /share/project/fengyupu/hf_hub/pi0_base
+  tokenizer: /share/project/fengyupu/hf_hub/paligemma-3b-pt-224
+  stat_path: /share/project/fengyupu/hf_hub/aloha_mobile_cabinet/meta/stats.json
+  device: "cuda"
+
+generate:
+  images_keys:
+    - observation.images.base_0_rgb
+    - observation.images.left_wrist_0_rgb
+    - observation.images.right_wrist_0_rgb
+  # Only used for warmup
+  images_shape: [3, 480, 640]
+  state_key: observation.state

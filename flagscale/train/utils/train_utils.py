@@ -19,9 +19,10 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
 # from lerobot.configs.train import TrainPipelineConfig
-from flagscale.models.pi0_base.configuration_pi0 import PI0Config
-from flagscale.models.pi0_base.modeling_pi0 import PI0Policy
+from flagscale.models.pi0_lerobot.configuration_pi0 import PI0Config
+from flagscale.models.pi0_lerobot.modeling_pi0 import PI0Policy
 from flagscale.train.datasets.utils import load_json, write_json
+
 # from lerobot.optim.optimizers import load_optimizer_state, save_optimizer_state
 # from lerobot.optim.schedulers import load_scheduler_state, save_scheduler_state
 # from lerobot.policies.pretrained import PreTrainedPolicy

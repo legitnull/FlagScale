@@ -55,7 +55,9 @@ def wait_for_ray_master(
     logger.info(f"Master info is {master_ip}:{port}")
     for attempt in range(max_attempts):
         status, msg = is_ray_master_running(master_ip, port)
-        logger.info(f"Check Ray master status (attempt {attempt+1}/{max_attempts}): {msg}")
+        logger.info(
+            f"Check Ray master status (attempt {attempt + 1}/{max_attempts}): {msg}"
+        )
 
         if status:
             return True
@@ -92,7 +94,9 @@ def parse_hostfile(hostfile_path):
             num_slots = int(match.group(2))
             machine_type = match.group(3) if match.group(3) else None
             if host in resources:
-                log_and_raise_error(f"Hostfile contains multiple entries for host: {host}.")
+                log_and_raise_error(
+                    f"Hostfile contains multiple entries for host: {host}."
+                )
             resources[host] = {"slots": num_slots, "type": machine_type}
         else:
             log_and_raise_error(f"Invalid entry in hostfile: {line}.")
@@ -239,18 +243,17 @@ def run_scp_command(host, src, dst, port=None, dryrun=False):
 
 def flatten_dict_to_args_verl(config_dict, pre_str=""):
     args = []
-    if 'config-path' in config_dict:
-        args.append(f'--config-path={config_dict["config-path"]}')
-        config_dict.pop('config-path')
+    if "config-path" in config_dict:
+        args.append(f"--config-path={config_dict['config-path']}")
+        config_dict.pop("config-path")
 
-    if 'config-name' in config_dict:
-        args.append(f'--config-name={config_dict["config-name"]}')
-        config_dict.pop('config-name')
+    if "config-name" in config_dict:
+        args.append(f"--config-name={config_dict['config-name']}")
+        config_dict.pop("config-name")
 
     for key, value in config_dict.items():
-
         if isinstance(value, dict):
-            if key == 'append_kargs':
+            if key == "append_kargs":
                 target_str = f"+"
             else:
                 target_str = f"{key}."
@@ -259,11 +262,11 @@ def flatten_dict_to_args_verl(config_dict, pre_str=""):
             v_str = ""
             for v in value:
                 v_str += f"{v}"
-            args.append(f"{pre_str+key}=" + v_str)
+            args.append(f"{pre_str + key}=" + v_str)
         elif isinstance(value, bool):
-            args.append(f"{pre_str+key}={value}")
+            args.append(f"{pre_str + key}={value}")
         else:
-            args.append(f"{pre_str+key}=" + f"{value}")
+            args.append(f"{pre_str + key}=" + f"{value}")
 
     return args
 
@@ -276,7 +279,11 @@ def flatten_dict_to_args(config_dict, ignore_keys=[], do_dash_replace=True):
         if do_dash_replace:
             key = key.replace("_", "-")
         if isinstance(value, dict):
-            args.extend(flatten_dict_to_args(value, ignore_keys, do_dash_replace=do_dash_replace))
+            args.extend(
+                flatten_dict_to_args(
+                    value, ignore_keys, do_dash_replace=do_dash_replace
+                )
+            )
         elif isinstance(value, list):
             args.append(f"--{key}")
             for v in value:
@@ -306,7 +313,9 @@ def get_nnodes(nnodes_from_hostfile=None, nnodes_from_args=None):
         return int(nnodes_from_args)
 
 
-def get_nproc_per_node(nproc_from_hostfile=None, nproc_from_args=None, num_visible_devices=None):
+def get_nproc_per_node(
+    nproc_from_hostfile=None, nproc_from_args=None, num_visible_devices=None
+):
     if nproc_from_hostfile is not None and nproc_from_args is not None:
         nproc = min(nproc_from_hostfile, int(nproc_from_args))
         if num_visible_devices:
@@ -402,7 +411,9 @@ def is_ip_addr(master):
 
     if not isinstance(master, str):
         return False
-    pattern = r"^((25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)\.){3}(25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)$"
+    pattern = (
+        r"^((25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)\.){3}(25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)$"
+    )
     result = re.match(pattern, master)
     if result:
         return True
@@ -411,9 +422,8 @@ def is_ip_addr(master):
 
 
 def is_master_node(lws_leader_address):
-
-    host_name = lws_leader_address.split('.')[0]
-    local_hostname = socket.gethostname().split('.')[0]
+    host_name = lws_leader_address.split(".")[0]
+    local_hostname = socket.gethostname().split(".")[0]
 
     return host_name == local_hostname
 
@@ -487,21 +497,37 @@ class RequestFuncOutput:
 
 
 def dummy_random_input(
-    tokenizer, prefix_len=0, input_len=1024, output_len=1024, num_prompts=1000, range_ratio=1.0
+    tokenizer,
+    prefix_len=0,
+    input_len=1024,
+    output_len=1024,
+    num_prompts=1000,
+    range_ratio=1.0,
 ):
-    prefix_token_ids = np.random.randint(0, tokenizer.vocab_size, size=prefix_len).tolist()
+    prefix_token_ids = np.random.randint(
+        0, tokenizer.vocab_size, size=prefix_len
+    ).tolist()
 
-    input_lens = np.random.randint(int(input_len * range_ratio), input_len + 1, size=num_prompts)
-    output_lens = np.random.randint(int(output_len * range_ratio), output_len + 1, size=num_prompts)
+    input_lens = np.random.randint(
+        int(input_len * range_ratio), input_len + 1, size=num_prompts
+    )
+    output_lens = np.random.randint(
+        int(output_len * range_ratio), output_len + 1, size=num_prompts
+    )
     offsets = np.random.randint(0, tokenizer.vocab_size, size=num_prompts)
     input_requests = []
     for i in range(num_prompts):
         prompt = tokenizer.decode(
             prefix_token_ids
-            + [(offsets[i] + i + j) % tokenizer.vocab_size for j in range(input_lens[i])]
+            + [
+                (offsets[i] + i + j) % tokenizer.vocab_size
+                for j in range(input_lens[i])
+            ]
         )
 
-        input_requests.append((prompt, int(prefix_len + input_lens[i]), int(output_lens[i]), None))
+        input_requests.append(
+            (prompt, int(prefix_len + input_lens[i]), int(output_lens[i]), None)
+        )
 
     return input_requests
 
@@ -510,11 +536,13 @@ async def async_request_openai_chat_completions(
     request_func_input: RequestFuncInput, pbar: Optional[tqdm] = None
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
-    assert api_url.endswith(
-        ("chat/completions", "profile")
-    ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
+    assert api_url.endswith(("chat/completions", "profile")), (
+        "OpenAI Chat Completions API URL must end with 'chat/completions'."
+    )
 
-    async with aiohttp.ClientSession(trust_env=True, timeout=AIOHTTP_TIMEOUT) as session:
+    async with aiohttp.ClientSession(
+        trust_env=True, timeout=AIOHTTP_TIMEOUT
+    ) as session:
         content = [{"type": "text", "text": request_func_input.prompt}]
         if request_func_input.multi_modal_content:
             content.append(request_func_input.multi_modal_content)
@@ -549,7 +577,9 @@ async def async_request_openai_chat_completions(
         st = time.perf_counter()
         most_recent_timestamp = st
         try:
-            async with session.post(url=api_url, json=payload, headers=headers) as response:
+            async with session.post(
+                url=api_url, json=payload, headers=headers
+            ) as response:
                 if response.status == 200:
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
@@ -614,7 +644,6 @@ async def benchmark(
     selected_percentile_metrics,
     selected_percentiles,
 ):
-
     async def limited_request_func(request_func_input, pbar):
         return await request_func(request_func_input=request_func_input, pbar=pbar)
 
@@ -665,10 +694,20 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
     print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
-    print("{:<40} {:<10.2f}".format("Request throughput (req/s):", metrics.request_throughput))
-    print("{:<40} {:<10.2f}".format("Output token throughput (tok/s):", metrics.output_throughput))
     print(
-        "{:<40} {:<10.2f}".format("Total Token throughput (tok/s):", metrics.total_token_throughput)
+        "{:<40} {:<10.2f}".format(
+            "Request throughput (req/s):", metrics.request_throughput
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Output token throughput (tok/s):", metrics.output_throughput
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Total Token throughput (tok/s):", metrics.total_token_throughput
+        )
     )
 
     result = {
@@ -696,7 +735,8 @@ async def benchmark(
         print("{s:{c}^{n}}".format(s=metric_header, n=50, c="-"))
         print(
             "{:<40} {:<10.2f}".format(
-                f"Mean {metric_name} (ms):", getattr(metrics, f"mean_{metric_attribute_name}_ms")
+                f"Mean {metric_name} (ms):",
+                getattr(metrics, f"mean_{metric_attribute_name}_ms"),
             )
         )
         print(
@@ -811,7 +851,9 @@ class ResourceManager:
                     node_found = node
                     break
             if node_found is None:
-                raise ValueError(f"Node {address} does not exist or resource type mismatch")
+                raise ValueError(
+                    f"Node {address} does not exist or resource type mismatch"
+                )
             free = node_found["slots"] - node_found["used"]
             if free < num:
                 raise ValueError("Insufficient resources")

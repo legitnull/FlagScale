@@ -76,7 +76,9 @@ class PI0Server:
             )
             logger.info(f"actions: {actions.shape}")
         actions_trunked = actions[
-            :, : self.config_generate["action_horizon"], : self.config_generate["action_dim"]
+            :,
+            : self.config_generate["action_horizon"],
+            : self.config_generate["action_dim"],
         ]
         logger.info(f"PI0 infer latency: {time.time() - t_s:.2f}s")
         logger.info(f"actions_trunked: {actions_trunked}")
@@ -95,7 +97,7 @@ PI0_SERVER: PI0Server = None
 def decode_image_base64(image_base64):
     try:
         image_data = base64.b64decode(image_base64)
-        image = Image.open(io.BytesIO(image_data)).convert('RGB')
+        image = Image.open(io.BytesIO(image_data)).convert("RGB")
         image = np.array(image).astype(np.float32) / 255.0
         # shape to: [C, H, W]
         image = torch.from_numpy(image).permute(2, 0, 1)
@@ -120,25 +122,27 @@ def process_images(images_json):
     return processed
 
 
-@app.route('/infer', methods=['POST'])
+@app.route("/infer", methods=["POST"])
 def infer_api():
     if PI0_SERVER is None:
         return jsonify({"success": False, "error": "Model not loaded"}), 503
     data = request.get_json()
     if not data:
         return jsonify({"success": False, "error": "Request format error"}), 400
-    if 'qpos' not in data:
+    if "qpos" not in data:
         return jsonify({"success": False, "error": "Request requires: qpos"}), 400
-    if 'eef_pose' not in data:
+    if "eef_pose" not in data:
         return jsonify({"success": False, "error": "Request requires: eef_pose"}), 400
     try:
-        qpos = torch.tensor(data['qpos']).cuda()
-        eef_pose = torch.tensor(data['eef_pose']).cuda()
-        instruction = data.get('instruction')
-        images = data.get('images')
+        qpos = torch.tensor(data["qpos"]).cuda()
+        eef_pose = torch.tensor(data["eef_pose"]).cuda()
+        instruction = data.get("instruction")
+        images = data.get("images")
     except Exception as e:
         return (
-            jsonify({"success": False, "error": f"State parameters processing error: {e}"}),
+            jsonify(
+                {"success": False, "error": f"State parameters processing error: {e}"}
+            ),
             400,
         )
     if instruction is None:
@@ -152,7 +156,9 @@ def infer_api():
                     for key in sample:
                         sample[key] = sample[key].cuda()
         except Exception as e:
-            return jsonify({"success": False, "error": f"image process failed: {e}"}), 400
+            return jsonify(
+                {"success": False, "error": f"image process failed: {e}"}
+            ), 400
 
     with torch.no_grad():
         batch = {
@@ -173,7 +179,10 @@ def parse_config() -> Union[DictConfig, ListConfig]:
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--config-path", type=str, required=True, help="Path to the configuration YAML file"
+        "--config-path",
+        type=str,
+        required=True,
+        help="Path to the configuration YAML file",
     )
     parser.add_argument("--log-dir", type=str, required=True, help="Path to the log")
     args = parser.parse_args()
