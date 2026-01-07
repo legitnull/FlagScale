@@ -1,3 +1,9 @@
+conda create -n robo_yupu python==3.12
+pip install . --verbose
+pip install -r requirements/train/robotics/requirements.txt
+
+pip install modelscope
+
 #  Install FlagScale
 
 Clone FlagScale code from github.
