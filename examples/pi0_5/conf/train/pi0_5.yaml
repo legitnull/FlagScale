@@ -20,13 +20,6 @@ system:
   shuffle: false
   grad_clip_norm: 1.0
   use_amp: false
-  # TODO: (yupu) The following configs will be implemented later
-  tensor_model_parallel_size: 1
-  pipeline_model_parallel_size: 1
-  context_parallel_size: 1
-  wandb_enabled: false
-  project_name: ${experiment.exp_name}
-  exp_name: ${experiment.exp_name}
 
 model:
   model_variant: pi0.5

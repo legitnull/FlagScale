@@ -1,74 +1,142 @@
-conda create -n robo_yupu python==3.12
-pip install . --verbose
-pip install -r requirements/train/robotics/requirements.txt
+# Installation
 
-pip install modelscope
-
-#  Install FlagScale
-
-Clone FlagScale code from github.
+## Clone Repository
 
 ```sh
-git clone -b refactor https://github.com/FlagOpen/FlagScale.git
+git clone https://github.com/FlagOpen/FlagScale.git
 cd FlagScale/
 ```
 
-Install train and inference env according to [README](https://github.com/FlagOpen/FlagScale/blob/main/README.md)
+## Setup Conda Environment
 
-# Download Model
-
-```sh
-git lfs install
-
-mkdir -p path-to-your-pi0_base-model
-cd path-to-your-pi0_base-model
-git clone https://huggingface.co/lerobot/pi0_base
-
-mkdir -p path-to-your-paligemma-3b-pt-224-tokenizer
-cd path-to-your-paligemma-3b-pt-224-tokenizer
-git clone https://huggingface.co/google/paligemma-3b-pt-224
-```
-
-If you don't have access to the international internet, download from modelscope.
+Create a new conda environment for robotics training:
 
 ```sh
-modelscope download --model lerobot/pi0_base --local_dir path-to-your-pi0_base-model
-modelscope download --model google/paligemma-3b-pt-224 --local_dir path-to-your-paligemma-3b-pt-224-tokenizer
+conda create -n flagos-robo python=3.12
+conda activate flagos-robo
 ```
+
+Install FlagScale and robotics dependencies:
+
+```sh
+cd FlagScale/
+pip install . --verbose
+pip install -r requirements/train/robotics/requirements.txt
+```
+
+Install additional dependencies for downloading models/datasets:
+
+```sh
+# For HuggingFace Hub
+pip install huggingface_hub
+
+# For ModelScope (optional)
+pip install modelscope
+```
+
+# Download Models and Tokenizers
+
+Download models and tokenizers using the provided script. The default download directory is `~/models`. Choose either HuggingFace Hub or ModelScope based on your preference:
+
+**Using HuggingFace Hub:**
+
+```sh
+cd FlagScale/
+python examples/pi0/download.py \
+    --repo_id lerobot/pi0_base \
+    --output_dir ~/models \
+    --source huggingface
+
+python examples/pi0/download.py \
+    --repo_id google/paligemma-3b-pt-224 \
+    --output_dir ~/models \
+    --source huggingface
+```
+
+**Using ModelScope:**
+
+```sh
+cd FlagScale/
+python examples/pi0/download.py \
+    --repo_id lerobot/pi0_base \
+    --output_dir ~/models \
+    --source modelscope
+
+python examples/pi0/download.py \
+    --repo_id google/paligemma-3b-pt-224 \
+    --output_dir ~/models \
+    --source modelscope
+```
+
+The models will be downloaded to:
+- `~/models/lerobot/pi0_base`
+- `~/models/google/paligemma-3b-pt-224`
 
 # Training
 
 ## Prepare Dataset
 
-FlagScale uses LeRobot dataset format. The training script expects a LeRobot dataset with the following structure:
+FlagScale uses the **LeRobotDataset v3.0** format. For detailed information about the format structure, see the [LeRobotDataset v3.0 documentation](https://huggingface.co/docs/lerobot/en/lerobot-dataset-v3).
 
-```
-dataset_root/
-├── data/
-│   ├── chunk-000/
-│   │   ├── file-000.parquet
-│   │   └── ...
-│   └── ...
-├── meta/
-│   ├── info.json
-│   ├── stats.json
-│   ├── tasks.parquet
-│   └── episodes/
-│       └── ...
-└── videos/  (optional)
-    └── ...
-```
+For example, to download the `aloha_mobile_cabinet` dataset:
 
-You can use an existing LeRobot dataset (e.g., `aloha_mobile_cabinet`) or convert your own data to LeRobot format. The dataset statistics (`stats.json`) are automatically loaded from the dataset's `meta/` directory.
-
-For example, to use the `aloha_mobile_cabinet` dataset:
+**Using HuggingFace Hub:**
 
 ```sh
-# Download the dataset from HuggingFace or modelscope
-# The dataset should be located at: path-to-your-dataset
+cd FlagScale/
+python examples/pi0/download.py \
+    --repo_id lerobot/aloha_mobile_cabinet \
+    --output_dir ~/datasets \
+    --repo_type dataset \
+    --source huggingface
 ```
 
+**Using ModelScope:**
+
+```sh
+python examples/pi0/download.py \
+    --repo_id lerobot/aloha_mobile_cabinet \
+    --output_dir ~/datasets \
+    --repo_type dataset \
+    --source modelscope
+```
+
+The dataset will be downloaded to `~/datasets/lerobot/aloha_mobile_cabinet`.
+python examples/pi0/download.py \
+    --repo_id lerobot/aloha_mobile_cabinet \
+    --output_dir ~/datasets \
+    --repo_type dataset \
+    --source modelscope
+```
+
+The dataset will be downloaded to `~/datasets/lerobot/aloha_mobile_cabinet`.
+
 ## Edit Config
+
+FlagScale uses a two-level configuration system:
+
+1. **Experiment-level config** (`examples/pi0/conf/train.yaml`): Defines experiment settings, environment variables, and resource allocation
+2. **Task-level config** (`examples/pi0/conf/train/pi0.yaml`): Defines model, dataset, and training hyperparameters
+
+### Experiment-Level Config
+
+Edit the experiment-level config for multi-GPU training:
+
+```sh
+cd FlagScale/
+vim examples/pi0/conf/train.yaml
+```
+
+Configure the following fields:
+
+- `experiment.envs.CUDA_VISIBLE_DEVICES` - GPU devices to use (e.g., `"0,1,2,3"` for 4 GPUs, `"0,1"` for 2 GPUs)
+- `experiment.envs.CUDA_DEVICE_MAX_CONNECTIONS` - Connection limit (typically `1`)
+- `experiment.exp_name` - Experiment name
+- `experiment.exp_dir` - Output directory for checkpoints and logs
+
+### Task-Level Config
+
+Edit the task-level config for model and training settings:
 
 ```sh
 cd FlagScale/
@@ -78,28 +146,27 @@ vim examples/pi0/conf/train/pi0.yaml
 Configure the following fields:
 
 **System settings** (training hyperparameters):
-- `system.use_accelerator` -> Whether to use HuggingFace Accelerator (default: `false`)
-- `system.batch_size` -> Batch size per GPU
-- `system.train_steps` -> Total training steps
-- `system.optimizer_lr` -> Learning rate
-- `system.save_checkpoint` -> Whether to save checkpoints
-- `system.save_freq` -> Steps between checkpoints
+- `system.batch_size` - Batch size per GPU
+- `system.train_steps` - Total training steps
+- `system.optimizer_lr` - Learning rate
+- `system.save_checkpoint` - Whether to save checkpoints (default: `true`)
+- `system.save_freq` - Steps between checkpoints
 
 **Model settings**:
-- `model.model_variant` -> Model variant: `"pi0"` or `"pi0.5"`
-- `model.checkpoint_dir` -> Path to pretrained model (e.g., `path-to-your-pi0_base-model`)
-- `model.tokenizer_path` -> Path to tokenizer (e.g., `path-to-your-paligemma-3b-pt-224-tokenizer`)
-- `model.tokenizer_max_length` -> Maximum tokenizer sequence length
-- `model.action_steps` -> Number of action steps to predict
+- `model.model_variant` - Model variant: `"pi0"` or `"pi0.5"`
+- `model.checkpoint_dir` - Path to pretrained model (e.g., `~/models/lerobot/pi0_base`)
+- `model.tokenizer_path` - Path to tokenizer (e.g., `~/models/google/paligemma-3b-pt-224`)
+- `model.tokenizer_max_length` - Maximum tokenizer sequence length
+- `model.action_steps` - Number of action steps to predict
 
 **Data settings**:
-- `data.data_path` -> Path to LeRobot dataset root (e.g., `path-to-your-dataset`)
-- `data.use_imagenet_stats` -> Whether to use ImageNet normalization stats (default: `true`)
-- `data.rename_map` -> JSON string mapping dataset keys to policy keys (optional):
+- `data.data_path` - Path to LeRobot dataset root (e.g., `~/datasets/lerobot/aloha_mobile_cabinet`)
+- `data.use_imagenet_stats` - Whether to use ImageNet normalization stats (default: `true`)
+- `data.rename_map` - JSON string mapping dataset keys to policy keys (optional):
   ```yaml
   rename_map: '{"observation.images.cam_high": "observation.images.base_0_rgb", "observation.images.cam_left_wrist": "observation.images.left_wrist_0_rgb", "observation.images.cam_right_wrist": "observation.images.right_wrist_0_rgb"}'
   ```
-- `data.use_quantiles` -> Whether to use quantile normalization (for `pi0.5`, set to `false` to use MEAN_STD normalization)
+- `data.use_quantiles` - Whether to use quantile normalization (for `pi0.5`, set to `false` to use MEAN_STD normalization)
 
 ## Start Training
 ```sh
@@ -156,22 +223,22 @@ vim examples/pi0/conf/inference/pi0.yaml
 Configure the following fields:
 
 **Engine settings:**
-- `engine.model` -> Path to pretrained model (e.g., `path-to-your-pi0_base-model`)
-- `engine.tokenizer` -> Path to tokenizer (e.g., `path-to-your-paligemma-3b-pt-224-tokenizer`)
-- `engine.stat_path` -> Path to dataset statistics (e.g., `path-to-your-dataset/meta/stats.json`)
-- `engine.device` -> Device to use (e.g., `"cuda"`)
+- `engine.model` - Path to pretrained model (e.g., `~/models/lerobot/pi0_base`)
+- `engine.tokenizer` - Path to tokenizer (e.g., `~/models/google/paligemma-3b-pt-224`)
+- `engine.stat_path` - Path to dataset statistics (e.g., `~/datasets/lerobot/aloha_mobile_cabinet/meta/stats.json`)
+- `engine.device` - Device to use (e.g., `"cuda"`)
 
 **Generate settings:**
-- `generate.images` -> Dictionary mapping image keys to file paths:
+- `generate.images` - Dictionary mapping image keys to file paths:
   ```yaml
   images:
     observation.images.cam_high: /path/to/image1.jpg
     observation.images.cam_left_wrist: /path/to/image2.jpg
     observation.images.cam_right_wrist: /path/to/image3.jpg
   ```
-- `generate.state_path` -> Path to state tensor file (`.pt` file)
-- `generate.task_path` -> Path to task prompt file (`.txt` file)
-- `generate.rename_map` (optional) -> Map input keys to policy expected keys:
+- `generate.state_path` - Path to state tensor file (`.pt` file)
+- `generate.task_path` - Path to task prompt file (`.txt` file)
+- `generate.rename_map` (optional) - Map input keys to policy expected keys:
   ```yaml
   rename_map:
     observation.images.cam_high: observation.images.base_0_rgb
@@ -209,26 +276,26 @@ vim examples/pi0/conf/serve/pi0.yaml
 Configure the following fields:
 
 **Engine settings:**
-- `engine.host` -> Server host (default: `"0.0.0.0"`)
-- `engine.port` -> Server port (default: `5000`)
-- `engine.model` -> Path to pretrained model (e.g., `path-to-your-pi0_base-model`)
-- `engine.tokenizer` -> Path to tokenizer (e.g., `path-to-your-paligemma-3b-pt-224-tokenizer`)
-- `engine.stat_path` -> Path to dataset statistics (e.g., `path-to-your-dataset/meta/stats.json`)
-- `engine.device` -> Device to use (e.g., `"cuda"`)
-- `engine.model_variant` (optional) -> Model variant: `"pi0"` or `"pi0.5"` (default: `"pi0"`)
-- `engine.use_quantiles` (optional) -> For `pi0.5`, set to `false` to use MEAN_STD normalization (default: `false`)
+- `engine.host` - Server host (default: `"0.0.0.0"`)
+- `engine.port` - Server port (default: `5000`)
+- `engine.model` - Path to pretrained model (e.g., `~/models/lerobot/pi0_base`)
+- `engine.tokenizer` - Path to tokenizer (e.g., `~/models/google/paligemma-3b-pt-224`)
+- `engine.stat_path` - Path to dataset statistics (e.g., `~/datasets/lerobot/aloha_mobile_cabinet/meta/stats.json`)
+- `engine.device` - Device to use (e.g., `"cuda"`)
+- `engine.model_variant` (optional) - Model variant: `"pi0"` or `"pi0.5"` (default: `"pi0"`)
+- `engine.use_quantiles` (optional) - For `pi0.5`, set to `false` to use MEAN_STD normalization (default: `false`)
 
 **Generate settings:**
-- `generate.images_keys` -> List of image keys expected by the model:
+- `generate.images_keys` - List of image keys expected by the model:
   ```yaml
   images_keys:
     - observation.images.base_0_rgb
     - observation.images.left_wrist_0_rgb
     - observation.images.right_wrist_0_rgb
   ```
-- `generate.images_shape` -> Image shape `[C, H, W]` for warmup (e.g., `[3, 480, 640]`)
-- `generate.state_key` -> Key for state in the batch (e.g., `"observation.state"`)
-- `generate.rename_map` (optional) -> Map client keys to model keys:
+- `generate.images_shape` - Image shape `[C, H, W]` for warmup (e.g., `[3, 480, 640]`)
+- `generate.state_key` - Key for state in the batch (e.g., `"observation.state"`)
+- `generate.rename_map` (optional) - Map client keys to model keys:
   ```yaml
   rename_map:
     observation.images.cam_high: observation.images.base_0_rgb
