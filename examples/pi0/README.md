@@ -36,7 +36,7 @@ pip install modelscope
 
 # Download Models and Tokenizers
 
-Download models and tokenizers using the provided script. The default download directory is `~/models`. Choose either HuggingFace Hub or ModelScope based on your preference:
+Download models and tokenizers using the provided script. Choose either HuggingFace Hub or ModelScope based on your preference:
 
 **Using HuggingFace Hub:**
 
@@ -44,12 +44,12 @@ Download models and tokenizers using the provided script. The default download d
 cd FlagScale/
 python examples/pi0/download.py \
     --repo_id lerobot/pi0_base \
-    --output_dir ~/models \
+    --output_dir /workspace/models \
     --source huggingface
 
 python examples/pi0/download.py \
     --repo_id google/paligemma-3b-pt-224 \
-    --output_dir ~/models \
+    --output_dir /workspace/models \
     --source huggingface
 ```
 
@@ -59,18 +59,19 @@ python examples/pi0/download.py \
 cd FlagScale/
 python examples/pi0/download.py \
     --repo_id lerobot/pi0_base \
-    --output_dir ~/models \
+    --output_dir /workspace/models \
     --source modelscope
 
 python examples/pi0/download.py \
     --repo_id google/paligemma-3b-pt-224 \
-    --output_dir ~/models \
+    --output_dir /workspace/models \
     --source modelscope
 ```
 
-The models will be downloaded to:
-- `~/models/lerobot/pi0_base`
-- `~/models/google/paligemma-3b-pt-224`
+The models will be downloaded to (example with `/workspace/models`):
+- `/workspace/models/lerobot/pi0_base`
+- `/workspace/models/google/paligemma-3b-pt-224`
+
 
 # Training
 
@@ -86,7 +87,7 @@ For example, to download the `aloha_mobile_cabinet` dataset:
 cd FlagScale/
 python examples/pi0/download.py \
     --repo_id lerobot/aloha_mobile_cabinet \
-    --output_dir ~/datasets \
+    --output_dir /workspace/datasets \
     --repo_type dataset \
     --source huggingface
 ```
@@ -94,22 +95,16 @@ python examples/pi0/download.py \
 **Using ModelScope:**
 
 ```sh
+cd FlagScale/
 python examples/pi0/download.py \
     --repo_id lerobot/aloha_mobile_cabinet \
-    --output_dir ~/datasets \
+    --output_dir /workspace/datasets \
     --repo_type dataset \
     --source modelscope
 ```
 
-The dataset will be downloaded to `~/datasets/lerobot/aloha_mobile_cabinet`.
-python examples/pi0/download.py \
-    --repo_id lerobot/aloha_mobile_cabinet \
-    --output_dir ~/datasets \
-    --repo_type dataset \
-    --source modelscope
-```
-
-The dataset will be downloaded to `~/datasets/lerobot/aloha_mobile_cabinet`.
+The dataset will be downloaded to (example with `/workspace/datasets`):
+- `/workspace/datasets/lerobot/aloha_mobile_cabinet`
 
 ## Edit Config
 
@@ -154,15 +149,15 @@ Configure the following fields:
 
 **Model settings**:
 - `model.model_variant` - Model variant: `"pi0"` or `"pi0.5"`
-- `model.checkpoint_dir` - Path to pretrained model (e.g., `~/models/lerobot/pi0_base`)
-- `model.tokenizer_path` - Path to tokenizer (e.g., `~/models/google/paligemma-3b-pt-224`)
+- `model.checkpoint_dir` - Path to pretrained model (e.g., `/workspace/models/lerobot/pi0_base`)
+- `model.tokenizer_path` - Path to tokenizer (e.g., `/workspace/models/google/paligemma-3b-pt-224`)
 - `model.tokenizer_max_length` - Maximum tokenizer sequence length
 - `model.action_steps` - Number of action steps to predict
 
 **Data settings**:
-- `data.data_path` - Path to LeRobot dataset root (e.g., `~/datasets/lerobot/aloha_mobile_cabinet`)
+- `data.data_path` - Path to LeRobot dataset root (e.g., `/workspace/datasets/lerobot/aloha_mobile_cabinet`)
 - `data.use_imagenet_stats` - Whether to use ImageNet normalization stats (default: `true`)
-- `data.rename_map` - JSON string mapping dataset keys to policy keys (optional):
+- `data.rename_map` - JSON string mapping dataset keys to policy keys (optional). Check the `features` key in your dataset's `meta/info.json` file to determine the correct mapping:
   ```yaml
   rename_map: '{"observation.images.cam_high": "observation.images.base_0_rgb", "observation.images.cam_left_wrist": "observation.images.left_wrist_0_rgb", "observation.images.cam_right_wrist": "observation.images.right_wrist_0_rgb"}'
   ```
@@ -174,6 +169,14 @@ cd FlagScale/
 python run.py --config-path ./examples/pi0/conf --config-name train action=run
 ```
 
+Training logs are saved to `outputs/pi0_train/logs/host_0_localhost.output` by default.
+
+## Stop Training
+```sh
+cd FlagScale/
+python run.py --config-path ./examples/pi0/conf --config-name train action=stop
+```
+
 # Inference
 
 ## Prepare Inference Inputs
@@ -183,7 +186,7 @@ You can extract inference inputs (images, state, task) from a dataset using the 
 ```sh
 cd FlagScale/
 python examples/pi0/dump_dataset_inputs.py \
-    --dataset_root /path/to/your/dataset \
+    --dataset_root /workspace/datasets/lerobot/aloha_mobile_cabinet \
     --output_dir ./inference_inputs \
     --frame_index 100
 ```
@@ -198,7 +201,7 @@ Alternatively, you can extract from a specific episode and frame:
 
 ```sh
 python examples/pi0/dump_dataset_inputs.py \
-    --dataset_root /path/to/your/dataset \
+    --dataset_root /workspace/datasets/lerobot/aloha_mobile_cabinet \
     --output_dir ./inference_inputs \
     --episode_index 0 \
     --frame_in_episode 50
@@ -208,7 +211,7 @@ Or extract multiple samples at once:
 
 ```sh
 python examples/pi0/dump_dataset_inputs.py \
-    --dataset_root /path/to/your/dataset \
+    --dataset_root /workspace/datasets/lerobot/aloha_mobile_cabinet \
     --output_dir ./inference_inputs \
     --frame_indices 100 200 300
 ```
@@ -223,9 +226,9 @@ vim examples/pi0/conf/inference/pi0.yaml
 Configure the following fields:
 
 **Engine settings:**
-- `engine.model` - Path to pretrained model (e.g., `~/models/lerobot/pi0_base`)
-- `engine.tokenizer` - Path to tokenizer (e.g., `~/models/google/paligemma-3b-pt-224`)
-- `engine.stat_path` - Path to dataset statistics (e.g., `~/datasets/lerobot/aloha_mobile_cabinet/meta/stats.json`)
+- `engine.model` - Path to pretrained model (e.g., `/workspace/models/lerobot/pi0_base`)
+- `engine.tokenizer` - Path to tokenizer (e.g., `/workspace/models/google/paligemma-3b-pt-224`)
+- `engine.stat_path` - Path to dataset statistics (e.g., `/workspace/datasets/lerobot/aloha_mobile_cabinet/meta/stats.json`)
 - `engine.device` - Device to use (e.g., `"cuda"`)
 
 **Generate settings:**
@@ -256,14 +259,6 @@ python run.py \
     action=run
 ```
 
-The script will:
-1. Load the model and preprocessor/postprocessor pipelines
-2. Load images, state, and task from the specified paths
-3. Apply preprocessing (including rename_map if provided)
-4. Run inference using `policy.select_action()`
-5. Apply postprocessing to denormalize the action
-6. Output the predicted action tensor
-
 # Serving
 
 ## Edit Config
@@ -278,9 +273,9 @@ Configure the following fields:
 **Engine settings:**
 - `engine.host` - Server host (default: `"0.0.0.0"`)
 - `engine.port` - Server port (default: `5000`)
-- `engine.model` - Path to pretrained model (e.g., `~/models/lerobot/pi0_base`)
-- `engine.tokenizer` - Path to tokenizer (e.g., `~/models/google/paligemma-3b-pt-224`)
-- `engine.stat_path` - Path to dataset statistics (e.g., `~/datasets/lerobot/aloha_mobile_cabinet/meta/stats.json`)
+- `engine.model` - Path to pretrained model (e.g., `/workspace/models/lerobot/pi0_base`)
+- `engine.tokenizer` - Path to tokenizer (e.g., `/workspace/models/google/paligemma-3b-pt-224`)
+- `engine.stat_path` - Path to dataset statistics (e.g., `/workspace/datasets/lerobot/aloha_mobile_cabinet/meta/stats.json`)
 - `engine.device` - Device to use (e.g., `"cuda"`)
 - `engine.model_variant` (optional) - Model variant: `"pi0"` or `"pi0.5"` (default: `"pi0"`)
 - `engine.use_quantiles` (optional) - For `pi0.5`, set to `false` to use MEAN_STD normalization (default: `false`)
