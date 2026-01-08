@@ -24,7 +24,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from flagscale.runner.utils import logger
 from flagscale.train.datasets.transforms import ImageTransforms
-from flagscale.train.datasets.lerobot_dataset import (
+from flagscale.train.datasets.lerobot import (
     LeRobotDataset,
     LeRobotDatasetMetadata,
 )

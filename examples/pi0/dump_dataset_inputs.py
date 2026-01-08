@@ -41,7 +41,7 @@ import torch
 from PIL import Image
 from torchvision.transforms import ToPILImage
 
-from flagscale.train.datasets.lerobot_dataset import LeRobotDataset
+from flagscale.train.datasets.lerobot import LeRobotDataset
 
 
 def tensor_to_image(tensor: torch.Tensor) -> Image.Image:

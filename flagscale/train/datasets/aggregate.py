@@ -26,7 +26,7 @@ import pandas as pd
 import tqdm
 
 from flagscale.train.datasets.compute_stats import aggregate_stats
-from flagscale.train.datasets.lerobot_dataset import LeRobotDatasetMetadata
+from flagscale.train.datasets.lerobot import LeRobotDatasetMetadata
 from flagscale.train.datasets.utils import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_DATA_FILE_SIZE_IN_MB,

@@ -33,7 +33,7 @@ import pyarrow as pa
 import torch
 import torchvision
 
-from datasets.features.features import register_feature
+# Defer datasets import to avoid circular import issues
 from PIL import Image
 
 
@@ -507,14 +507,99 @@ class VideoFrame:
         return self.pa_type
 
 
-with warnings.catch_warnings():
-    warnings.filterwarnings(
-        "ignore",
-        "'register_feature' is experimental and might be subject to breaking changes in the future.",
-        category=UserWarning,
-    )
-    # to make VideoFrame available in HuggingFace `datasets`
-    register_feature(VideoFrame, "VideoFrame")
+# Lazy registration to avoid circular import issues
+_videoframe_registered = False
+
+
+def _ensure_videoframe_registered():
+    """Lazily register VideoFrame feature with HuggingFace datasets."""
+    global _videoframe_registered
+    if _videoframe_registered:
+        return
+
+    try:
+        import importlib
+        import os
+        import sys
+
+        # Check if datasets module is already correctly loaded
+        datasets_module = sys.modules.get('datasets')
+        datasets_features = None
+
+        if datasets_module is not None and hasattr(datasets_module, 'Dataset'):
+            # Check if it's the HuggingFace datasets package (not our local package)
+            try:
+                cwd = os.getcwd()
+                if not (hasattr(datasets_module, '__file__') and cwd in datasets_module.__file__):
+                    # Already have the correct datasets module loaded, try to use it directly
+                    try:
+                        datasets_features = importlib.import_module('datasets.features.features')
+                    except:
+                        # Couldn't import submodule, need to reload
+                        datasets_module = None
+                else:
+                    # It's our local package, need to reload
+                    datasets_module = None
+            except:
+                # If any error checking, try to import
+                try:
+                    datasets_features = importlib.import_module('datasets.features.features')
+                except:
+                    datasets_module = None
+
+        # Only do sys.path manipulation if we don't have the correct module
+        if datasets_module is None or datasets_features is None:
+            # Save original sys.path and sys.modules state
+            original_path = sys.path.copy()
+            original_datasets = sys.modules.get('datasets')
+            datasets_submodules = {
+                key: value for key, value in sys.modules.items() if key.startswith('datasets.')
+            }
+
+            try:
+                # Temporarily remove project directory from sys.path
+                cwd = os.getcwd()
+                paths_to_remove = [p for p in sys.path if p.startswith(cwd) or p == '' or p == '.']
+                for p in paths_to_remove:
+                    while p in sys.path:
+                        sys.path.remove(p)
+
+                # Clean up sys.modules
+                modules_to_remove = [
+                    key
+                    for key in sys.modules.keys()
+                    if key == 'datasets' or key.startswith('datasets.')
+                ]
+                for key in modules_to_remove:
+                    del sys.modules[key]
+
+                # Import the real datasets package
+                datasets_features = importlib.import_module('datasets.features.features')
+            finally:
+                # Restore original sys.path and sys.modules
+                sys.path[:] = original_path
+                if original_datasets is not None:
+                    sys.modules['datasets'] = original_datasets
+                for key, value in datasets_submodules.items():
+                    sys.modules[key] = value
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                "'register_feature' is experimental and might be subject to breaking changes in the future.",
+                category=UserWarning,
+            )
+            # to make VideoFrame available in HuggingFace `datasets`
+            datasets_features.register_feature(VideoFrame, "VideoFrame")
+
+        _videoframe_registered = True
+    except Exception as e:
+        logging.warning(f"Failed to register VideoFrame feature: {e}")
+
+
+# Note: VideoFrame registration is now lazy - _ensure_videoframe_registered()
+# will be called automatically when needed, not at module import time
+# to avoid triggering PyArrow extension type re-registration issues.
 
 
 def get_audio_info(video_path: Path | str) -> dict:

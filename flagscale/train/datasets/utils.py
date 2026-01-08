@@ -24,9 +24,10 @@ from collections import deque
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from pprint import pformat
-from typing import Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
-import datasets
+# Defer datasets import to avoid circular import issues
+# Import only when needed inside functions
 import numpy as np
 import packaging.version
 import pandas
@@ -35,9 +36,6 @@ import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import torch
 
-from datasets import Dataset
-from datasets.table import embed_table_storage
-from datasets.utils.logging import disable_progress_bar, enable_progress_bar
 from huggingface_hub import DatasetCard, DatasetCardData, HfApi
 from huggingface_hub.errors import RevisionNotFoundError
 from PIL import Image as PILImage
@@ -50,6 +48,12 @@ from flagscale.train.datasets.backward_compatibility import (
     BackwardCompatibilityError,
     ForwardCompatibilityError,
 )
+
+# Import datasets types only for type checking to avoid circular imports at runtime
+if TYPE_CHECKING:
+    import datasets
+
+    from datasets import Dataset
 
 DEFAULT_CHUNK_SIZE = 1000  # Max number of files per chunk
 DEFAULT_DATA_FILE_SIZE_IN_MB = 100  # Max size per file
@@ -97,10 +101,30 @@ class SuppressProgressBars:
     """
 
     def __enter__(self):
-        disable_progress_bar()
+        import importlib
+        import sys
+
+        # Avoid confusion with local 'datasets' package
+        local_datasets_module = sys.modules.get('flagscale.train.datasets')
+        datasets_in_sys = sys.modules.get('datasets')
+        if datasets_in_sys is local_datasets_module:
+            del sys.modules['datasets']
+
+        datasets_logging = importlib.import_module('datasets.utils.logging')
+        datasets_logging.disable_progress_bar()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        enable_progress_bar()
+        import importlib
+        import sys
+
+        # Avoid confusion with local 'datasets' package
+        local_datasets_module = sys.modules.get('flagscale.train.datasets')
+        datasets_in_sys = sys.modules.get('datasets')
+        if datasets_in_sys is local_datasets_module:
+            del sys.modules['datasets']
+
+        datasets_logging = importlib.import_module('datasets.utils.logging')
+        datasets_logging.enable_progress_bar()
 
 
 def is_valid_numpy_dtype_string(dtype_str: str) -> bool:
@@ -127,7 +151,7 @@ def get_parquet_file_size_in_mb(parquet_path: str | Path) -> float:
     return total_uncompressed_size / (1024**2)
 
 
-def get_hf_dataset_size_in_mb(hf_ds: Dataset) -> int:
+def get_hf_dataset_size_in_mb(hf_ds: "Dataset") -> int:
     return hf_ds.data.nbytes // (1024**2)
 
 
@@ -141,8 +165,8 @@ def update_chunk_file_indices(chunk_idx: int, file_idx: int, chunks_size: int) -
 
 
 def load_nested_dataset(
-    pq_dir: Path, features: datasets.Features | None = None, episodes: list[int] | None = None
-) -> Dataset:
+    pq_dir: Path, features: "datasets.Features | None" = None, episodes: list[int] | None = None
+) -> "Dataset":
     """Find parquet files in provided directory {pq_dir}/chunk-xxx/file-xxx.parquet
     Convert parquet files to pyarrow memory mapped in a cache folder for efficient RAM usage
     Concatenate all pyarrow references to return HF Dataset format
@@ -152,6 +176,77 @@ def load_nested_dataset(
         features: Optional features schema to ensure consistent loading of complex types like images
         episodes: Optional list of episode indices to filter. Uses PyArrow predicate pushdown for efficiency.
     """
+    # Import HuggingFace datasets package with special handling to avoid local package confusion
+    import importlib
+    import os
+    import sys
+
+    # Check if datasets module is already correctly loaded
+    datasets_module = sys.modules.get('datasets')
+    Dataset = None
+    need_reload = True
+
+    if datasets_module is not None and hasattr(datasets_module, 'Dataset'):
+        # Check if it's the HuggingFace datasets package (not our local package)
+        try:
+            cwd = os.getcwd()
+            if not (hasattr(datasets_module, '__file__') and cwd in datasets_module.__file__):
+                # Already have the correct datasets module loaded, use it directly
+                Dataset = datasets_module.Dataset
+                need_reload = False
+        except:
+            # If any error checking, assume it's correct
+            try:
+                Dataset = datasets_module.Dataset
+                need_reload = False
+            except:
+                pass
+
+    # Only do sys.path manipulation if we need to reload
+    if need_reload:
+        # Save original sys.path
+        original_path = sys.path.copy()
+
+        try:
+            # Temporarily remove project directory from sys.path
+            cwd = os.getcwd()
+            paths_to_remove = [p for p in sys.path if p.startswith(cwd) or p == '' or p == '.']
+            for p in paths_to_remove:
+                while p in sys.path:
+                    sys.path.remove(p)
+
+            # Clean up sys.modules - remove both 'datasets' and all 'datasets.*' submodules
+            modules_to_remove = [
+                key
+                for key in sys.modules.keys()
+                if key == 'datasets' or key.startswith('datasets.')
+            ]
+            for key in modules_to_remove:
+                del sys.modules[key]
+
+            # Import using importlib.import_module which handles submodules correctly
+            hf_datasets = importlib.import_module('datasets')
+
+            # Verify we got the right module
+            if not hasattr(hf_datasets, 'Dataset'):
+                raise ImportError(
+                    f"Loaded datasets module doesn't have Dataset attribute. "
+                    f"Module location: {hf_datasets.__file__}"
+                )
+
+            # Verify it's not our local package
+            if cwd in hf_datasets.__file__:
+                raise ImportError(
+                    f"Found local package instead of HuggingFace datasets: {hf_datasets.__file__}"
+                )
+
+            Dataset = hf_datasets.Dataset
+
+        finally:
+            # Only restore sys.path, NOT sys.modules
+            # We want to keep the newly loaded datasets module in sys.modules
+            sys.path[:] = original_path
+
     paths = sorted(pq_dir.glob("*/*.parquet"))
     if len(paths) == 0:
         raise FileNotFoundError(f"Provided directory does not contain any parquet file: {pq_dir}")
@@ -271,7 +366,7 @@ def serialize_dict(stats: dict[str, torch.Tensor | np.ndarray | dict]) -> dict:
     return unflatten_dict(serialized_dict)
 
 
-def embed_images(dataset: datasets.Dataset) -> datasets.Dataset:
+def embed_images(dataset: "datasets.Dataset") -> "datasets.Dataset":
     """Embed image bytes into the dataset table before saving to Parquet.
 
     This function prepares a Hugging Face dataset for serialization by converting
@@ -283,6 +378,69 @@ def embed_images(dataset: datasets.Dataset) -> datasets.Dataset:
     Returns:
         datasets.Dataset: The dataset with images embedded in the table storage.
     """
+    import importlib
+    import os
+    import sys
+
+    # Check if datasets module is already correctly loaded
+    datasets_module = sys.modules.get('datasets')
+    embed_table_storage = None
+
+    if datasets_module is not None and hasattr(datasets_module, 'Dataset'):
+        # Check if it's the HuggingFace datasets package (not our local package)
+        try:
+            cwd = os.getcwd()
+            if not (hasattr(datasets_module, '__file__') and cwd in datasets_module.__file__):
+                # Already have the correct datasets module loaded, use it directly
+                datasets = datasets_module
+                from datasets.table import embed_table_storage
+            else:
+                # It's our local package, need to reload
+                datasets_module = None
+        except:
+            # If any error checking, assume it's correct
+            datasets = datasets_module
+            try:
+                from datasets.table import embed_table_storage
+            except:
+                datasets_module = None
+
+    # Only do sys.path manipulation if we don't have the correct module
+    if datasets_module is None or embed_table_storage is None:
+        # Save original sys.path and sys.modules state
+        original_path = sys.path.copy()
+        original_datasets = sys.modules.get('datasets')
+        datasets_submodules = {
+            key: value for key, value in sys.modules.items() if key.startswith('datasets.')
+        }
+
+        try:
+            # Temporarily remove project directory from sys.path
+            cwd = os.getcwd()
+            paths_to_remove = [p for p in sys.path if p.startswith(cwd) or p == '' or p == '.']
+            for p in paths_to_remove:
+                while p in sys.path:
+                    sys.path.remove(p)
+
+            # Clean up sys.modules
+            modules_to_remove = [
+                key
+                for key in sys.modules.keys()
+                if key == 'datasets' or key.startswith('datasets.')
+            ]
+            for key in modules_to_remove:
+                del sys.modules[key]
+
+            datasets = importlib.import_module('datasets')
+            from datasets.table import embed_table_storage
+        finally:
+            # Restore original sys.path and sys.modules
+            sys.path[:] = original_path
+            if original_datasets is not None:
+                sys.modules['datasets'] = original_datasets
+            for key, value in datasets_submodules.items():
+                sys.modules[key] = value
+
     # Embed image bytes into the table before saving to parquet
     format = dataset.format
     dataset = dataset.with_format("arrow")
@@ -391,7 +549,7 @@ def load_tasks(local_dir: Path) -> pandas.DataFrame:
     return tasks
 
 
-def write_episodes(episodes: Dataset, local_dir: Path) -> None:
+def write_episodes(episodes: "Dataset", local_dir: Path) -> None:
     """Write episode metadata to a parquet file in the LeRobot v3.0 format.
     This function writes episode-level metadata to a single parquet file.
     Used primarily during dataset conversion (v2.1 → v3.0) and in test fixtures.
@@ -413,7 +571,7 @@ def write_episodes(episodes: Dataset, local_dir: Path) -> None:
     episodes.to_parquet(fpath)
 
 
-def load_episodes(local_dir: Path) -> datasets.Dataset:
+def load_episodes(local_dir: Path) -> "Dataset":
     episodes = load_nested_dataset(local_dir / EPISODES_DIR)
     # Select episode features/columns containing references to episode data and videos
     # (e.g. tasks, dataset_from_index, dataset_to_index, data/chunk_index, data/file_index, etc.)
@@ -610,7 +768,7 @@ def get_safe_version(repo_id: str, version: str | packaging.version.Version) -> 
     raise ForwardCompatibilityError(repo_id, min(upper_versions))
 
 
-def get_hf_features_from_features(features: dict) -> datasets.Features:
+def get_hf_features_from_features(features: dict) -> "datasets.Features":
     """Convert a LeRobot features dictionary to a `datasets.Features` object.
 
     Args:
@@ -622,6 +780,61 @@ def get_hf_features_from_features(features: dict) -> datasets.Features:
     Raises:
         ValueError: If a feature has an unsupported shape.
     """
+    import importlib
+    import os
+    import sys
+
+    # Check if datasets module is already correctly loaded
+    datasets_module = sys.modules.get('datasets')
+    if datasets_module is not None and hasattr(datasets_module, 'Features'):
+        # Check if it's the HuggingFace datasets package (not our local package)
+        try:
+            cwd = os.getcwd()
+            if not (hasattr(datasets_module, '__file__') and cwd in datasets_module.__file__):
+                # Already have the correct datasets module loaded, use it directly
+                datasets = datasets_module
+            else:
+                # It's our local package, need to reload
+                datasets_module = None
+        except:
+            # If any error checking, assume it's correct
+            datasets = datasets_module
+
+    # Only do sys.path manipulation if we don't have the correct module
+    if datasets_module is None or not hasattr(datasets_module, 'Features'):
+        # Save original sys.path and sys.modules state
+        original_path = sys.path.copy()
+        original_datasets = sys.modules.get('datasets')
+        datasets_submodules = {
+            key: value for key, value in sys.modules.items() if key.startswith('datasets.')
+        }
+
+        try:
+            # Temporarily remove project directory from sys.path
+            cwd = os.getcwd()
+            paths_to_remove = [p for p in sys.path if p.startswith(cwd) or p == '' or p == '.']
+            for p in paths_to_remove:
+                while p in sys.path:
+                    sys.path.remove(p)
+
+            # Clean up sys.modules
+            modules_to_remove = [
+                key
+                for key in sys.modules.keys()
+                if key == 'datasets' or key.startswith('datasets.')
+            ]
+            for key in modules_to_remove:
+                del sys.modules[key]
+
+            datasets = importlib.import_module('datasets')
+        finally:
+            # Restore original sys.path and sys.modules
+            sys.path[:] = original_path
+            if original_datasets is not None:
+                sys.modules['datasets'] = original_datasets
+            for key, value in datasets_submodules.items():
+                sys.modules[key] = value
+
     hf_features = {}
     for key, ft in features.items():
         if ft["dtype"] == "video":
@@ -1219,8 +1432,68 @@ def to_parquet_with_hf_images(df: pandas.DataFrame, path: Path) -> None:
     """This function correctly writes to parquet a panda DataFrame that contains images encoded by HF dataset.
     This way, it can be loaded by HF dataset and correctly formatted images are returned.
     """
+    import importlib
+    import os
+    import sys
+
+    # Check if datasets module is already correctly loaded
+    datasets_module = sys.modules.get('datasets')
+    Dataset = None
+
+    if datasets_module is not None and hasattr(datasets_module, 'Dataset'):
+        # Check if it's the HuggingFace datasets package (not our local package)
+        try:
+            cwd = os.getcwd()
+            if not (hasattr(datasets_module, '__file__') and cwd in datasets_module.__file__):
+                # Already have the correct datasets module loaded, use it directly
+                datasets = datasets_module
+                Dataset = datasets.Dataset
+            else:
+                # It's our local package, need to reload
+                datasets_module = None
+        except:
+            # If any error checking, assume it's correct
+            datasets = datasets_module
+            Dataset = datasets.Dataset
+
+    # Only do sys.path manipulation if we don't have the correct module
+    if datasets_module is None or Dataset is None:
+        # Save original sys.path and sys.modules state
+        original_path = sys.path.copy()
+        original_datasets = sys.modules.get('datasets')
+        datasets_submodules = {
+            key: value for key, value in sys.modules.items() if key.startswith('datasets.')
+        }
+
+        try:
+            # Temporarily remove project directory from sys.path
+            cwd = os.getcwd()
+            paths_to_remove = [p for p in sys.path if p.startswith(cwd) or p == '' or p == '.']
+            for p in paths_to_remove:
+                while p in sys.path:
+                    sys.path.remove(p)
+
+            # Clean up sys.modules
+            modules_to_remove = [
+                key
+                for key in sys.modules.keys()
+                if key == 'datasets' or key.startswith('datasets.')
+            ]
+            for key in modules_to_remove:
+                del sys.modules[key]
+
+            datasets = importlib.import_module('datasets')
+            Dataset = datasets.Dataset
+        finally:
+            # Restore original sys.path and sys.modules
+            sys.path[:] = original_path
+            if original_datasets is not None:
+                sys.modules['datasets'] = original_datasets
+            for key, value in datasets_submodules.items():
+                sys.modules[key] = value
+
     # TODO(qlhoest): replace this weird synthax by `df.to_parquet(path)` only
-    datasets.Dataset.from_dict(df.to_dict(orient="list")).to_parquet(path)
+    Dataset.from_dict(df.to_dict(orient="list")).to_parquet(path)
 
 
 def item_to_torch(item: dict) -> dict:
@@ -1410,7 +1683,9 @@ class Backtrackable(Generic[T]):
             return False
 
 
-def safe_shard(dataset: datasets.IterableDataset, index: int, num_shards: int) -> datasets.Dataset:
+def safe_shard(
+    dataset: "datasets.IterableDataset", index: int, num_shards: int
+) -> "datasets.Dataset":
     """
     Safe shards the dataset.
     """

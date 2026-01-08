@@ -37,7 +37,7 @@ from flagscale.models.configs.types import (
     PolicyFeature,
 )
 from flagscale.models.utils.constants import ACTION
-from flagscale.train.datasets.lerobot_dataset import LeRobotDataset
+from flagscale.train.datasets.lerobot import LeRobotDataset
 
 
 @dataclass
