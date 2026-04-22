@@ -7,6 +7,7 @@ import random
 import time
 from collections.abc import Iterator
 from contextlib import nullcontext
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +27,6 @@ from flagscale.train.datasets.lerobot_dataset import (
     LeRobotDataset,
     LeRobotDatasetMetadata,
 )
-from flagscale.train.datasets.video_utils import decode_video_frames
 from flagscale.train.datasets.utils import dataset_to_policy_features
 from flagscale.models.configs.types import FeatureType
 from flagscale.train.processor import PolicyProcessorPipeline
@@ -51,90 +51,69 @@ from flagscale.train.utils.random_utils import serialize_rng_state, deserialize_
 from flagscale.train.utils.optim_setup import setup_optimizer_and_scheduler
 from flagscale.models.vla import TrainablePolicy
 from flagscale.models.vla.pretrained_config import PreTrainedConfig
+from flagscale.models.vla.vlm.qwenvl_backbone import _to_pil
 from flagscale.platforms import get_platform
+from qwen_vl_utils import process_vision_info
 
 
-class FutureImageDataset(torch.utils.data.Dataset):
-    """Wrapper around LeRobotDataset that fetches future video frames for NFP training.
+class LeRobotDatasetWithFutureFrames(LeRobotDataset):
+    """LeRobotDataset subclass that splits future frames from video tensors.
 
-    For each sample, decodes a future frame at `current_timestamp + future_offset / fps`
-    from the same episode's video file. The future frame is stored under the key
-    ``future_image`` in the returned dict, matching what ``Qwen35Gr00t.forward()`` expects
-    for the lerobot code path.
-
-    If the future timestamp exceeds the episode boundary, the last frame of the
-    episode is used (clamped).
+    When delta_timestamps includes a future offset for video keys, LeRobotDataset
+    returns video tensors with shape [T, H, W, C]. This subclass splits them into
+    current frame (index 0) under the original key and future frames under
+    ``{vid_key}_future`` keys, matching starVLA's naming convention.
     """
 
-    def __init__(
-        self,
-        dataset: LeRobotDataset,
-        future_offset: int = 1,
-        image_transforms=None,
-    ):
-        self.dataset = dataset
-        self.future_offset = future_offset
-        self.image_transforms = image_transforms
-
-    def __len__(self):
-        return len(self.dataset)
-
-    @property
-    def num_frames(self):
-        return self.dataset.num_frames
-
-    @property
-    def num_episodes(self):
-        return self.dataset.num_episodes
-
-    @property
-    def meta(self):
-        return self.dataset.meta
-
-    @property
-    def fps(self):
-        return self.dataset.fps
-
     def __getitem__(self, idx):
-        item = self.dataset[idx]
-        ep_idx = item["episode_index"].item()
-        current_ts = item["timestamp"].item()
-        fps = self.dataset.fps
-
-        # Compute future timestamp, clamped to episode boundary
-        ep = self.dataset.meta.episodes[ep_idx]
-        ep_end_idx = ep["dataset_to_index"]
-        ep_start_idx = ep["dataset_from_index"]
-        ep_length = ep_end_idx - ep_start_idx
-        # Max timestamp within this episode
-        max_ts = (ep_length - 1) / fps
-        future_ts = min(current_ts + self.future_offset / fps, max_ts)
-
-        # Decode future frame from each camera video
-        future_frames = []
-        for vid_key in self.dataset.meta.video_keys:
-            from_timestamp = ep[f"videos/{vid_key}/from_timestamp"]
-            shifted_ts = [from_timestamp + future_ts]
-            video_path = self.dataset.root / self.dataset.meta.get_video_file_path(ep_idx, vid_key)
-            frames = decode_video_frames(
-                video_path, shifted_ts, self.dataset.tolerance_s, self.dataset.video_backend
-            )
-            frame = frames.squeeze(0)  # [C, H, W] float
-            if self.image_transforms is not None:
-                frame = self.image_transforms(frame)
-                # image_transforms already returns HWC uint8
-            else:
-                # Convert CHW float → HWC uint8 to match observation image format
-                frame = frame.permute(1, 2, 0)  # [H, W, C]
-                frame = (frame * 255).clamp(0, 255).to(torch.uint8)
-            future_frames.append(frame)
-
-        # Use only the first camera's future frame for NFP target.
-        # Multiple cameras are handled via separate observation keys for the
-        # current frame; NFP only needs a single future image embedding.
-        item["future_image"] = future_frames[0]
-
+        item = super().__getitem__(idx)
+        for vid_key in self.meta.video_keys:
+            if vid_key in item and item[vid_key].dim() >= 4:
+                item[f"{vid_key}_future"] = item[vid_key][1]
+                item[vid_key] = item[vid_key][0]
         return item
+
+
+def qwen_collate_fn(batch_list, *, processor, prompt_template, image_feature_keys):
+    batch = torch.utils.data.default_collate(batch_list)
+
+    instructions = batch["task"]
+    if isinstance(instructions, torch.Tensor):
+        instructions = instructions.detach().cpu().tolist()
+    if isinstance(instructions, str):
+        instructions = [instructions]
+
+    def _build_inputs(feature_keys):
+        batch_images = None
+        for key in feature_keys:
+            imgs = batch[key]
+            if isinstance(imgs, torch.Tensor) and imgs.ndim == 3:
+                imgs = [imgs]
+            key_images = [_to_pil(img) for img in imgs]
+            if batch_images is None:
+                batch_images = [[img] for img in key_images]
+            else:
+                for sample_imgs, img in zip(batch_images, key_images):
+                    sample_imgs.append(img)
+
+        messages = []
+        for imgs, instruction in zip(batch_images, instructions):
+            content = [{"type": "image", "image": img} for img in imgs]
+            prompt = prompt_template.replace("{instruction}", instruction) if prompt_template else instruction
+            content.append({"type": "text", "text": prompt})
+            messages.append([{"role": "user", "content": content}])
+
+        texts = [processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True) for m in messages]
+        image_inputs, video_inputs = process_vision_info(messages)
+        return processor(text=texts, images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt")
+
+    batch["qwen_inputs"] = _build_inputs(image_feature_keys)
+
+    future_keys = [f"{k}_future" for k in image_feature_keys]
+    if future_keys and future_keys[0] in batch:
+        batch["qwen_future_inputs"] = _build_inputs(future_keys)
+
+    return batch
 
 
 def set_seed(seed: int):
@@ -178,7 +157,19 @@ def make_dataset(config: TrainConfig, policy_config: PreTrainedConfig):
     ds_meta = LeRobotDatasetMetadata(root=config.data.data_path, revision=None)
     delta_timestamps = _resolve_delta_timestamps(policy_config, ds_meta)
 
-
+    # _resolve_delta_timestamps applies observation_delta_indices uniformly to all
+    # observation keys (video + state), but the future frame offset should only
+    # apply to video keys. We inject it manually here so that LeRobotDataset
+    # decodes both current and future frames in a single video decode call,
+    # avoiding the cost of opening the video file twice.
+    future_offset = getattr(config.data, "future_offset", None)
+    if future_offset is not None:
+        if delta_timestamps is None:
+            delta_timestamps = {}
+        for vid_key in ds_meta.video_keys:
+            ts_list = list(delta_timestamps.get(vid_key, [0.0]))
+            ts_list.append(int(future_offset) / ds_meta.fps)
+            delta_timestamps[vid_key] = ts_list
     # torchcodec depends on NVIDIA NVDEC which is not available on all platforms (e.g. MUSA);
     # fall back to pyav for non-CUDA platforms or when torchcodec is broken.
     video_backend = "pyav"
@@ -207,7 +198,7 @@ def make_dataset(config: TrainConfig, policy_config: PreTrainedConfig):
 
     image_transforms = _resize_to_uint8_hwc
 
-    dataset = LeRobotDataset(
+    dataset = LeRobotDatasetWithFutureFrames(
         root=config.data.data_path,
         episodes=None,
         delta_timestamps=delta_timestamps,
@@ -216,16 +207,6 @@ def make_dataset(config: TrainConfig, policy_config: PreTrainedConfig):
         video_backend=video_backend,
         tolerance_s=config.data.tolerance_s,
     )
-
-    # Wrap with FutureImageDataset when NFP is enabled
-    future_offset = getattr(config.data, "future_offset", None)
-    if future_offset is not None:
-        logger.info(f"NFP enabled: wrapping dataset with FutureImageDataset (future_offset={future_offset})")
-        dataset = FutureImageDataset(
-            dataset=dataset,
-            future_offset=int(future_offset),
-            image_transforms=image_transforms,
-        )
 
     return dataset
 
@@ -643,12 +624,20 @@ def main(config: TrainConfig, seed: int):
             seed=seed,
         )
 
+        collate_fn = partial(
+            qwen_collate_fn,
+            processor=policy.vlm.processor,
+            prompt_template=policy.vlm._prompt_template,
+            image_feature_keys=list(policy.image_features.keys()),
+        )
+
         dataloader = torch.utils.data.DataLoader(
             dataset,
             num_workers=num_workers,
             batch_size=config.system.batch_size,
             shuffle=False,  # Must be False when using sampler
             sampler=sampler,
+            collate_fn=collate_fn,
             pin_memory=True,
             drop_last=False,
             prefetch_factor=2 if num_workers > 0 else None,
@@ -744,14 +733,18 @@ def main(config: TrainConfig, seed: int):
     else:
         samples_per_epoch = 0
 
+    def _to_device(v, dev):
+        if isinstance(v, torch.Tensor):
+            return v.to(dev, non_blocking=True)
+        if isinstance(v, dict):
+            return {k: _to_device(val, dev) for k, val in v.items()}
+        return v
+
     for _ in range(step, config.system.train_steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
-        if isinstance(batch, dict):  # lerobot: move batched tensors to device
-            batch = {
-                k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
-                for k, v in batch.items()
-            }
+        if isinstance(batch, dict):
+            batch = {k: _to_device(v, device) for k, v in batch.items()}
 
         vlm_batch = next(vlm_dl_iter) if vlm_dl_iter is not None else None
         if vlm_batch is not None:
@@ -761,11 +754,7 @@ def main(config: TrainConfig, seed: int):
             }
 
         if preprocessor is not None:
-            # Preserve keys that preprocessor's batch_to_transition would drop
-            _future_image = batch.pop("future_image", None) if isinstance(batch, dict) else None
             batch = preprocessor(batch)
-            if _future_image is not None:
-                batch["future_image"] = _future_image
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
         train_tracker = update_policy(

@@ -20,9 +20,8 @@ import torch
 import torch.nn.functional as F
 from safetensors.torch import save_file
 
-from .configuration_qwen3_5_gr00t import NFPConfig, Qwen35Gr00tConfig
+from .configuration_qwen3_5_gr00t import Qwen35Gr00tConfig
 from flagscale.logger import logger
-from flagscale.models.vla.action_model.gr00t_action_header_dynamic import GatedMLP
 from flagscale.models.utils.constants import (
     ACTION,
     OBS_STATE,
@@ -30,6 +29,7 @@ from flagscale.models.utils.constants import (
     VLM_CONFIG_DIR,
     resolve_pretrained_dir,
 )
+from flagscale.models.vla.action_model.gr00t_action_header_dynamic import GatedMLP
 from flagscale.models.vla.base_policy import TrainablePolicy
 from flagscale.models.vla.registry import build_action_model, build_vlm
 from flagscale.models.vla.utils import get_vlm_config
@@ -92,7 +92,8 @@ class Qwen35Gr00t(TrainablePolicy):
         mse_loss = F.mse_loss(nfp_outputs, nfp_targets, reduction="none").mean(-1)
         mse_loss = mse_loss.sum() / (nfp_outputs.shape[0] + 1e-12)
         cosine_loss = F.cosine_embedding_loss(
-            nfp_outputs, nfp_targets,
+            nfp_outputs,
+            nfp_targets,
             torch.ones(nfp_outputs.size(0), device=nfp_outputs.device),
             reduction="none",
         )
@@ -111,14 +112,17 @@ class Qwen35Gr00t(TrainablePolicy):
                 state = [ex["state"] for ex in batch]
             else:
                 state = None
+            qwen_inputs = self.vlm.build_qwenvl_inputs(images, instructions)
         else:  # lerobot: single dict with batched tensors
-            images, instructions = self.vlm.prepare_input(
-                batch, image_feature_keys=list(self.image_features.keys())
-            )
+            if "qwen_inputs" in batch:
+                qwen_inputs = batch["qwen_inputs"]
+            else:
+                images, instructions = self.vlm.prepare_input(
+                    batch, image_feature_keys=list(self.image_features.keys())
+                )
+                qwen_inputs = self.vlm.build_qwenvl_inputs(images, instructions)
             actions = [batch[ACTION][i] for i in range(batch[ACTION].shape[0])]
             state = batch.get(OBS_STATE) if self.use_state else None
-
-        qwen_inputs = self.vlm.build_qwenvl_inputs(images, instructions)
 
         # NFP: build future image embeddings if NFP is enabled
         nfp_feature = None
@@ -130,9 +134,8 @@ class Qwen35Gr00t(TrainablePolicy):
             else:
                 qwen_future_inputs = batch.get("qwen_future_inputs")
                 if qwen_future_inputs is None:
-                    future_images, _ = self.vlm.prepare_input(
-                        batch, image_feature_keys=["future_image"]
-                    )
+                    future_keys = [f"{k}_future" for k in self.image_features]
+                    future_images, _ = self.vlm.prepare_input(batch, image_feature_keys=future_keys)
                     qwen_future_inputs = self.vlm.build_qwenvl_inputs(future_images, instructions)
 
             image_mask = qwen_inputs["input_ids"] == self.nfp_config.image_token_id
@@ -162,9 +165,11 @@ class Qwen35Gr00t(TrainablePolicy):
                 mse_loss, cosine_loss = self._nfp_loss(nfp_outputs, future_image_embeddings)
                 nfp_losses["nfp_mse_loss_0"] = mse_loss
                 nfp_losses["nfp_cosine_loss_0"] = cosine_loss
-                nfp_feature = nfp_outputs.reshape(
-                    last_hidden.shape[0], -1, nfp_outputs.shape[-1]
-                ).detach().clone()
+                nfp_feature = (
+                    nfp_outputs.reshape(last_hidden.shape[0], -1, nfp_outputs.shape[-1])
+                    .detach()
+                    .clone()
+                )
 
         target_horizon = self.config.action_model.action_horizon
 
@@ -206,7 +211,11 @@ class Qwen35Gr00t(TrainablePolicy):
         if self.nfp_config is not None:
             action_loss = output["loss"]
             result = {"raw_action_loss": action_loss}
-            loss = action_loss if self.use_action_policy_loss else torch.tensor(0.0, device=action_loss.device, requires_grad=True)
+            loss = (
+                action_loss
+                if self.use_action_policy_loss
+                else torch.tensor(0.0, device=action_loss.device, requires_grad=True)
+            )
             for k, v in nfp_losses.items():
                 result[k] = v
                 if "mse" in k:
@@ -274,9 +283,7 @@ class Qwen35Gr00t(TrainablePolicy):
             image_mask = qwen_inputs["input_ids"] == self.nfp_config.image_token_id
             nfp_input = last_hidden[image_mask]
             nfp_outputs = self.nfp_head(nfp_input)
-            nfp_feature = nfp_outputs.reshape(
-                last_hidden.shape[0], -1, nfp_outputs.shape[-1]
-            )
+            nfp_feature = nfp_outputs.reshape(last_hidden.shape[0], -1, nfp_outputs.shape[-1])
 
         if state is not None:
             state = state.to(device=last_hidden.device, dtype=last_hidden.dtype)

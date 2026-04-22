@@ -65,8 +65,8 @@ model:
 
   normalization_mapping:
     VISUAL: IDENTITY
-    STATE: IDENTITY
-    ACTION: IDENTITY
+    STATE: MIN_MAX
+    ACTION: MIN_MAX
 
   optimizer:
     name: AdamW
