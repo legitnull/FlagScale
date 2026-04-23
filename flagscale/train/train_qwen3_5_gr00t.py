@@ -543,18 +543,25 @@ def update_policy(
     """
     start_time = time.perf_counter()
 
+    skip_vla = False  # Set to False to enable VLA forward+backward
     optimizer.zero_grad()
 
     autocast_context = (
         torch.amp.autocast(get_platform().amp_device_type(), dtype=torch.bfloat16) if use_amp else nullcontext()
     )
-    with autocast_context:
-        output = policy(batch, vlm_batch=vlm_batch)
-        loss = output["loss"]
-        if "vlm_loss" in output:
-            loss = loss + vlm_loss_scale * output["vlm_loss"]
 
-    loss.backward()
+    with autocast_context:
+        output = policy(batch, vlm_batch=vlm_batch, skip_vla=skip_vla)
+        vla_loss = output["loss"]
+
+    if not skip_vla:
+        vla_loss.backward()
+
+    if "vlm_loss" in output:
+        vlm_loss_scaled = vlm_loss_scale * output["vlm_loss"]
+        vlm_loss_scaled.backward()
+
+    loss = vla_loss.detach() + (vlm_loss_scale * output["vlm_loss"].detach() if "vlm_loss" in output else 0.0)
 
     # Clip gradients (torch.nn.utils.clip_grad_norm_ works with DTensors in PyTorch ≥2.6)
     grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -764,6 +771,7 @@ def main(config: TrainConfig, seed: int):
     }
     if vlm_dl_iter is not None:
         train_metrics["vlm_loss"] = AverageMeter("vlm_loss", ":.3f")
+        train_metrics["vlm_loss_pure"] = AverageMeter("vlm_loss_pure", ":.3f")
 
     effective_batch_size = config.system.batch_size * world_size
 

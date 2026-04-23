@@ -597,7 +597,7 @@ def make_vlm_dataloader(cfg):
         train_dataset,
         batch_size=cfg.datasets.vlm_data.per_device_batch_size,
         collate_fn=data_collator,
-        num_workers=2,
+        num_workers=4,
     )
 
     return {

@@ -101,9 +101,17 @@ class Qwen35Gr00t(TrainablePolicy):
         return mse_loss, cosine_loss
 
     def forward(
-        self, batch: list[dict] | dict, vlm_batch: dict[str, torch.Tensor] | None = None
+        self, batch: list[dict] | dict, vlm_batch: dict[str, torch.Tensor] | None = None, skip_vla: bool = False
     ) -> dict[str, torch.Tensor]:
         """ """
+        if skip_vla:
+            result = {"loss": torch.tensor(0.0, device=next(self.parameters()).device, requires_grad=True)}
+            if vlm_batch is not None:
+                with torch.autocast(get_platform().amp_device_type(), dtype=torch.bfloat16):
+                    vlm_loss = self.vlm.model(**vlm_batch, return_dict=True).loss
+                result["vlm_loss"] = vlm_loss
+            return result
+
         if isinstance(batch, list):  # wds: list of per-sample dicts
             images = [ex["image"] for ex in batch]
             instructions = [ex["lang"] for ex in batch]
