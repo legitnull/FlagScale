@@ -27,6 +27,7 @@ from flagscale.train.datasets.lerobot_dataset import (
     LeRobotDataset,
     LeRobotDatasetMetadata,
 )
+from flagscale.train.datasets.lerobot_mixture_dataset import LeRobotMixtureDataset
 from flagscale.train.datasets.utils import dataset_to_policy_features
 from flagscale.models.configs.types import FeatureType
 from flagscale.train.processor import PolicyProcessorPipeline
@@ -57,20 +58,21 @@ from qwen_vl_utils import process_vision_info
 
 
 class LeRobotDatasetWithFutureFrames(LeRobotDataset):
-    """LeRobotDataset subclass that splits future frames from video tensors.
+    """LeRobotDataset subclass that splits future frames from visual tensors.
 
-    When delta_timestamps includes a future offset for video keys, LeRobotDataset
-    returns video tensors with shape [T, H, W, C]. This subclass splits them into
+    When delta_timestamps includes a future offset for camera keys, LeRobotDataset
+    returns tensors with an extra time dimension (e.g. [T, C, H, W] for video,
+    [T, C, H, W] for image via _query_hf_dataset). This subclass splits them into
     current frame (index 0) under the original key and future frames under
-    ``{vid_key}_future`` keys, matching starVLA's naming convention.
+    ``{cam_key}_future`` keys, matching starVLA's naming convention.
     """
 
     def __getitem__(self, idx):
         item = super().__getitem__(idx)
-        for vid_key in self.meta.video_keys:
-            if vid_key in item and item[vid_key].dim() >= 4:
-                item[f"{vid_key}_future"] = item[vid_key][1]
-                item[vid_key] = item[vid_key][0]
+        for cam_key in self.meta.camera_keys:
+            if cam_key in item and item[cam_key].dim() >= 4:
+                item[f"{cam_key}_future"] = item[cam_key][1]
+                item[cam_key] = item[cam_key][0]
         return item
 
 
@@ -153,23 +155,7 @@ def apply_fsdp2(policy, device_mesh):
     fully_shard(policy, **fsdp_config)
 
 
-def make_dataset(config: TrainConfig, policy_config: PreTrainedConfig):
-    ds_meta = LeRobotDatasetMetadata(root=config.data.data_path, revision=None)
-    delta_timestamps = _resolve_delta_timestamps(policy_config, ds_meta)
-
-    # _resolve_delta_timestamps applies observation_delta_indices uniformly to all
-    # observation keys (video + state), but the future frame offset should only
-    # apply to video keys. We inject it manually here so that LeRobotDataset
-    # decodes both current and future frames in a single video decode call,
-    # avoiding the cost of opening the video file twice.
-    future_offset = getattr(config.data, "future_offset", None)
-    if future_offset is not None:
-        if delta_timestamps is None:
-            delta_timestamps = {}
-        for vid_key in ds_meta.video_keys:
-            ts_list = list(delta_timestamps.get(vid_key, [0.0]))
-            ts_list.append(int(future_offset) / ds_meta.fps)
-            delta_timestamps[vid_key] = ts_list
+def _resolve_video_backend():
     # torchcodec depends on NVIDIA NVDEC which is not available on all platforms (e.g. MUSA);
     # fall back to pyav for non-CUDA platforms or when torchcodec is broken.
     video_backend = "pyav"
@@ -181,7 +167,10 @@ def make_dataset(config: TrainConfig, policy_config: PreTrainedConfig):
         except Exception:
             logger.info("torchcodec unavailable, falling back to pyav")
             video_backend = "pyav"
+    return video_backend
 
+
+def _make_image_transforms():
     def _resize_to_uint8_hwc(frame: torch.Tensor) -> torch.Tensor:
         """float32 CHW [0,1] from torchcodec → uint8 HWC 224x224 via PIL resize."""
         if frame.dim() == 4:
@@ -196,17 +185,79 @@ def make_dataset(config: TrainConfig, policy_config: PreTrainedConfig):
         pil = Image.fromarray(frame_uint8.cpu().numpy()).resize((224, 224))
         return torch.from_numpy(np.array(pil))
 
-    image_transforms = _resize_to_uint8_hwc
+    return _resize_to_uint8_hwc
 
-    dataset = LeRobotDatasetWithFutureFrames(
-        root=config.data.data_path,
+
+def _make_single_dataset(
+    data_path: str,
+    policy_config: PreTrainedConfig,
+    future_offset: float | None,
+    tolerance_s: float,
+    video_backend: str = "pyav",
+    image_transforms=None,
+) -> LeRobotDatasetWithFutureFrames:
+    ds_meta = LeRobotDatasetMetadata(root=data_path, revision=None)
+    delta_timestamps = _resolve_delta_timestamps(policy_config, ds_meta)
+
+    # _resolve_delta_timestamps applies observation_delta_indices uniformly to all
+    # observation keys, but the future frame offset should only apply to camera
+    # keys (video or image). We inject it manually here.
+    if future_offset is not None:
+        if delta_timestamps is None:
+            delta_timestamps = {}
+        for cam_key in ds_meta.camera_keys:
+            ts_list = list(delta_timestamps.get(cam_key, [0.0]))
+            ts_list.append(int(future_offset) / ds_meta.fps)
+            delta_timestamps[cam_key] = ts_list
+
+    return LeRobotDatasetWithFutureFrames(
+        root=data_path,
         episodes=None,
         delta_timestamps=delta_timestamps,
         image_transforms=image_transforms,
         revision=None,
         video_backend=video_backend,
-        tolerance_s=config.data.tolerance_s,
+        tolerance_s=tolerance_s,
     )
+
+
+def make_dataset(config: TrainConfig, policy_config: PreTrainedConfig, seed: int = 42):
+    future_offset = getattr(config.data, "future_offset", None)
+    data_mix = getattr(config.data, "data_mix", None)
+    video_backend = _resolve_video_backend()
+    image_transforms = _make_image_transforms()
+
+    if data_mix is not None:
+        data_root_dir = getattr(config.data, "data_root_dir", None)
+        if data_root_dir is None:
+            raise ValueError("data_root_dir must be set when using data_mix")
+
+        from examples.qwen3_5_gr00t.mixtures import DATASET_MIXTURES
+        if data_mix not in DATASET_MIXTURES:
+            raise ValueError(f"Unknown data_mix: {data_mix}. Available: {list(DATASET_MIXTURES.keys())}")
+
+        mixture_spec = DATASET_MIXTURES[data_mix]
+        data_mixture = []
+        for dataset_name, weight in mixture_spec:
+            data_path = f"{data_root_dir}/{dataset_name}"
+            ds = _make_single_dataset(
+                data_path, policy_config, future_offset, config.data.tolerance_s,
+                video_backend=video_backend, image_transforms=image_transforms,
+            )
+            data_mixture.append((ds, weight))
+
+        balance = getattr(config.data, "balance_dataset_weights", True)
+        dataset = LeRobotMixtureDataset(
+            data_mixture=data_mixture,
+            mode="train",
+            balance_dataset_weights=balance,
+            seed=seed,
+        )
+    else:
+        dataset = _make_single_dataset(
+            config.data.data_path, policy_config, future_offset, config.data.tolerance_s,
+            video_backend=video_backend, image_transforms=image_transforms,
+        )
 
     return dataset
 
@@ -600,15 +651,15 @@ def main(config: TrainConfig, seed: int):
         num_frames = 1
         num_episodes = 1
     else:
-        dataset = make_dataset(config, policy_config)
+        dataset = make_dataset(config, policy_config, seed=seed)
         dist.barrier()
 
         policy = make_policy(policy_config, dataset.meta)
         dist.barrier()
 
-        # Create processors - only provide dataset_stats if not resuming from saved processors
+        dataset_stats = dataset.merged_stats if isinstance(dataset, LeRobotMixtureDataset) else dataset.meta.stats
         preprocessor, postprocessor = make_pre_post_processors(
-            policy, config.data, dataset_stats=dataset.meta.stats, device=device.type,
+            policy, config.data, dataset_stats=dataset_stats, device=device.type,
         )
 
         num_workers = config.system.num_workers
@@ -730,6 +781,8 @@ def main(config: TrainConfig, seed: int):
         if resume_from and samples_per_epoch > 0:
             epoch = step // samples_per_epoch
         sampler.set_epoch(epoch)
+        if isinstance(dataset, LeRobotMixtureDataset):
+            dataset.set_epoch(epoch)
     else:
         samples_per_epoch = 0
 
@@ -777,6 +830,8 @@ def main(config: TrainConfig, seed: int):
         if sampler is not None and samples_per_epoch > 0 and step % samples_per_epoch == 0:
             epoch += 1
             sampler.set_epoch(epoch)
+            if isinstance(dataset, LeRobotMixtureDataset):
+                dataset.set_epoch(epoch)
 
         if step % config.system.log_freq == 0:
             logger.info(f"step: {step} {format_train_tracker_step(train_tracker)}")

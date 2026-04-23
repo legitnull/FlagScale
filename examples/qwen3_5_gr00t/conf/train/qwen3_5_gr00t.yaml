@@ -105,6 +105,11 @@ data:
     state_key: eepose
   data_path: /nfs/zhangqq/datasets/lerobot/vla_data/0_30_s_activitynetqa_v21_tmp/
   tolerance_s: 0.02
+
+  # Multi-dataset mixture (set data_mix to use, or leave null for single dataset via data_path)
+  # data_mix: ego1
+  # data_root_dir: /nfs/zhangqq/datasets/lerobot/vla_data
+  # balance_dataset_weights: true
   preprocessor:
     name: policy_preprocessor
     steps:
