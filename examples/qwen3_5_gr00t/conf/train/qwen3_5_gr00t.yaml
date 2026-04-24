@@ -1,6 +1,6 @@
 system:
   batch_size: 1
-  train_steps: 125
+  train_steps: 5000
   log_freq: 1
   grad_clip_norm: 1.0
   use_amp: true
@@ -11,13 +11,13 @@ system:
   checkpoint:
     output_directory: ${experiment.exp_dir}
     save_checkpoint: true
-    save_freq: 200
+    save_freq: 10000
 
 model:
   model_name: qwen3_5_gr00t
   vlm:
     type: qwen3.5-vl
-    base_vlm: /nfs/zhangqq/models/Qwen/Qwen3_5-4B/
+    base_vlm: /share/project/wangyihao/starVLA/playground/Model/Qwen3.5-4B/
     attn_implementation: flash_attention_2
   action_model:
     use_state: false
@@ -65,8 +65,8 @@ model:
 
   normalization_mapping:
     VISUAL: IDENTITY
-    STATE: MIN_MAX
-    ACTION: MIN_MAX
+    STATE: IDENTITY
+    ACTION: IDENTITY
 
   optimizer:
     name: AdamW
@@ -81,7 +81,7 @@ model:
         lr: 1.0e-04
     scheduler:
       name: cosine_with_min_lr
-      warmup_steps: 5000
+      warmup_steps: 500
       scheduler_kwargs:
         min_lr: 1.0e-06
 
@@ -103,7 +103,7 @@ data:
     vision_root: ""
     action_key: eepose
     state_key: eepose
-  data_path: /nfs/zhangqq/datasets/lerobot/vla_data/0_30_s_activitynetqa_v21_tmp/
+  data_path: /share/project/zhangqq/lerobot_data/nfs/zhangqq/datasets/lerobot/vla_data/0_30_s_activitynetqa_v21_tmp/
   tolerance_s: 0.02
 
   # Multi-dataset mixture (set data_mix to use, or leave null for single dataset via data_path)
@@ -136,12 +136,15 @@ data:
 
   # VLM co-training data (uncomment to enable)
   vlm_data:
-    vlm_data_root: /nfs/zhangqq/datasets/lerobot/vlm_data
-    video_data_root: /nfs/zhangqq/datasets/lerobot/vlm_data
-    image_root: /nfs/zhangqq/datasets/lerobot/vlm_data
+    # vlm_data_root: /nfs/zhangqq/datasets/lerobot/vlm_data
+    # video_data_root: /nfs/zhangqq/datasets/lerobot/vlm_data
+    # image_root: /nfs/zhangqq/datasets/lerobot/vlm_data
+    vlm_data_root: /share/project/wangyihao/starVLA/playground/Datasets/VLM_DATA
+    video_data_root: /share/project/mycao/web_video_train
+    image_root: /share/project/mycao/robobrain_v2_5_sz
     dataset_use: activitynetqa_0_30_s
     eval_dataset: activitynetqa_0_30_s
-    per_device_batch_size: 8
+    per_device_batch_size: 1
     model_max_length: 4608
     max_pixels: 307200
     min_pixels: 784

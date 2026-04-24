@@ -771,7 +771,6 @@ def main(config: TrainConfig, seed: int):
     }
     if vlm_dl_iter is not None:
         train_metrics["vlm_loss"] = AverageMeter("vlm_loss", ":.3f")
-        train_metrics["vlm_loss_pure"] = AverageMeter("vlm_loss_pure", ":.3f")
 
     effective_batch_size = config.system.batch_size * world_size
 

@@ -16,7 +16,9 @@ Flow-matching header is copyright from GR00T N1.5,
 import dataclasses
 from pathlib import Path
 
+import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import save_file
 
@@ -29,7 +31,7 @@ from flagscale.models.utils.constants import (
     VLM_CONFIG_DIR,
     resolve_pretrained_dir,
 )
-from flagscale.models.vla.action_model.gr00t_action_header_dynamic import GatedMLP
+from flagscale.models.vla.action_model.gr00t_action_header_dynamic import GatedMLP, PerLayerHeadGating
 from flagscale.models.vla.base_policy import TrainablePolicy
 from flagscale.models.vla.registry import build_action_model, build_vlm
 from flagscale.models.vla.utils import get_vlm_config
@@ -59,6 +61,35 @@ class Qwen35Gr00t(TrainablePolicy):
         vlm_hidden_size = get_vlm_config(self.vlm.model_config)["hidden_size"]
         config.action_model.diffusion_model_cfg["cross_attention_dim"] = vlm_hidden_size
 
+        # NFP (Next Frame Prediction) head — init before action_model to match starVLA init order
+        self.nfp_config = config.nfp
+        if self.nfp_config is not None:
+            nfp_head_num = getattr(self.nfp_config, "nfp_head_num", 1)
+            self.nfp_head_num = nfp_head_num
+            if self.nfp_head_num == 1:
+                self.nfp_head = GatedMLP(
+                    hidden_dim=self.nfp_config.vl_hidden_dim,
+                    expand_ratio=self.nfp_config.expand_ratio,
+                    depth=self.nfp_config.depth,
+                    dropout=self.nfp_config.dropout,
+                )
+            else:
+                self.nfp_head = nn.ModuleList([
+                    GatedMLP(
+                        hidden_dim=self.nfp_config.vl_hidden_dim,
+                        expand_ratio=self.nfp_config.expand_ratio,
+                        depth=self.nfp_config.depth,
+                        dropout=self.nfp_config.dropout,
+                    )
+                    for _ in range(self.nfp_head_num)
+                ])
+                action_condition_mode = getattr(self.nfp_config, "action_condition_mode", "concat")
+                if action_condition_mode == "gate":
+                    self.nfp_head_gating = PerLayerHeadGating(
+                        config.action_model.diffusion_model_cfg["num_layers"] // 4,
+                        self.nfp_head_num,
+                    )
+
         self.action_model = build_action_model(
             config.action_model.type,
             config=config.action_model,
@@ -66,16 +97,6 @@ class Qwen35Gr00t(TrainablePolicy):
 
         self.future_action_window_size = config.action_model.future_action_window_size
         self.use_state = config.action_model.use_state
-
-        # NFP (Next Frame Prediction) head
-        self.nfp_config = config.nfp
-        if self.nfp_config is not None:
-            self.nfp_head = GatedMLP(
-                hidden_dim=self.nfp_config.vl_hidden_dim,
-                expand_ratio=self.nfp_config.expand_ratio,
-                depth=self.nfp_config.depth,
-                dropout=self.nfp_config.dropout,
-            )
         self.use_action_policy_loss = config.use_action_policy_loss
 
         if config.input_features:
@@ -121,6 +142,7 @@ class Qwen35Gr00t(TrainablePolicy):
             else:
                 state = None
             qwen_inputs = self.vlm.build_qwenvl_inputs(images, instructions)
+            qwen_future_inputs = None
         else:  # lerobot: single dict with batched tensors
             if "qwen_inputs" in batch:
                 qwen_inputs = batch["qwen_inputs"]
@@ -131,20 +153,21 @@ class Qwen35Gr00t(TrainablePolicy):
                 qwen_inputs = self.vlm.build_qwenvl_inputs(images, instructions)
             actions = [batch[ACTION][i] for i in range(batch[ACTION].shape[0])]
             state = batch.get(OBS_STATE) if self.use_state else None
+            qwen_future_inputs = None  # will be computed below
 
         # NFP: build future image embeddings if NFP is enabled
         nfp_feature = None
-        nfp_losses = {}
         if self.nfp_config is not None:
-            if isinstance(batch, list):
-                future_images = [ex["all_future_images"] for ex in batch]
-                qwen_future_inputs = self.vlm.build_qwenvl_inputs(future_images, instructions)
-            else:
-                qwen_future_inputs = batch.get("qwen_future_inputs")
-                if qwen_future_inputs is None:
-                    future_keys = [f"{k}_future" for k in self.image_features]
-                    future_images, _ = self.vlm.prepare_input(batch, image_feature_keys=future_keys)
+            if qwen_future_inputs is None:
+                if isinstance(batch, list):
+                    future_images = [ex["all_future_images"] for ex in batch]
                     qwen_future_inputs = self.vlm.build_qwenvl_inputs(future_images, instructions)
+                else:
+                    qwen_future_inputs = batch.get("qwen_future_inputs")
+                    if qwen_future_inputs is None:
+                        future_keys = [f"{k}_future" for k in self.image_features]
+                        future_images, _ = self.vlm.prepare_input(batch, image_feature_keys=future_keys)
+                        qwen_future_inputs = self.vlm.build_qwenvl_inputs(future_images, instructions)
 
             image_mask = qwen_inputs["input_ids"] == self.nfp_config.image_token_id
             future_image_embeddings = self.vlm.build_image_embeddings(**qwen_future_inputs)
@@ -158,35 +181,61 @@ class Qwen35Gr00t(TrainablePolicy):
             else:
                 last_hidden = vlm_output["hidden_states"][-1]  # [B, L, H]
 
-        # NFP forward
+        # NFP forward — aligned with starVLA QwenGR00TDynamic35
+        nfp_mse_loss = []
+        nfp_cosine_loss = []
         if self.nfp_config is not None:
             nfp_input = last_hidden[image_mask]
+
             if nfp_input.shape[0] == 0:
                 device = last_hidden.device
                 zero_loss = torch.tensor(0.0, device=device, requires_grad=True)
-                nfp_losses["nfp_mse_loss_0"] = zero_loss
-                nfp_losses["nfp_cosine_loss_0"] = zero_loss
-                B, D = last_hidden.shape[0], last_hidden.shape[-1]
+                nfp_mse_loss = [zero_loss] * (self.nfp_head_num if self.nfp_head_num > 1 else 1)
+                nfp_cosine_loss = [zero_loss] * (self.nfp_head_num if self.nfp_head_num > 1 else 1)
+                B = last_hidden.shape[0]
+                D = last_hidden.shape[-1]
                 nfp_feature = torch.zeros(B, 1, D, device=device, dtype=last_hidden.dtype)
+
+            elif self.nfp_head_num > 1:
+                nfp_feature_list, nfp_mse_loss, nfp_cosine_loss = [], [], []
+                B = last_hidden.shape[0]
+                T = self.nfp_head_num
+                V = qwen_inputs['image_grid_thw'].shape[0] // B
+                P = qwen_inputs['image_grid_thw'][0].prod().item() // 4
+                D = last_hidden.shape[-1]
+
+                fut_emb = future_image_embeddings.view(B, V, T, P, D)
+
+                for i, head in enumerate(self.nfp_head):
+                    nfp_outputs = head(nfp_input)
+                    mse_loss, cosine_loss = self._nfp_loss(nfp_outputs, fut_emb[:, :, i].reshape(-1, D))
+                    nfp_mse_loss.append(mse_loss)
+                    nfp_cosine_loss.append(cosine_loss)
+                    nfp_feature_list.append(nfp_outputs.reshape(B, -1, nfp_outputs.shape[-1]).detach().clone())
+
+                action_condition_mode = getattr(self.nfp_config, "action_condition_mode", "concat")
+                if action_condition_mode == "gate":
+                    nfp_feature = self.nfp_head_gating(nfp_feature_list)
+                else:
+                    nfp_feature = torch.cat(nfp_feature_list, dim=1)
+
             else:
                 nfp_outputs = self.nfp_head(nfp_input)
                 mse_loss, cosine_loss = self._nfp_loss(nfp_outputs, future_image_embeddings)
-                nfp_losses["nfp_mse_loss_0"] = mse_loss
-                nfp_losses["nfp_cosine_loss_0"] = cosine_loss
-                nfp_feature = (
-                    nfp_outputs.reshape(last_hidden.shape[0], -1, nfp_outputs.shape[-1])
-                    .detach()
-                    .clone()
-                )
-
-        target_horizon = self.config.action_model.action_horizon
+                nfp_mse_loss, nfp_cosine_loss = [mse_loss], [cosine_loss]
+                nfp_feature = nfp_outputs.reshape(last_hidden.shape[0], -1, nfp_outputs.shape[-1]).detach().clone()
 
         with torch.autocast(get_platform().amp_device_type(), dtype=torch.float32):
-            # Align with starVLA: direct slice, no padding/mask
             if isinstance(actions, list):
-                actions = torch.stack(actions)
-            actions = actions.to(device=last_hidden.device, dtype=last_hidden.dtype)
-            actions_target = actions[:, -target_horizon:, :]  # (B, action_horizon, action_dim)
+                if isinstance(actions[0], torch.Tensor):
+                    actions = torch.stack(actions).to(device=last_hidden.device, dtype=last_hidden.dtype)
+                else:
+                    actions = torch.tensor(
+                        np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype,
+                    )
+            else:
+                actions = actions.to(device=last_hidden.device, dtype=last_hidden.dtype)
+            actions_target = actions[:, -(self.future_action_window_size + 1):, :]
 
             repeated_diffusion_steps = self.config.action_model.repeated_diffusion_steps
 
@@ -196,8 +245,14 @@ class Qwen35Gr00t(TrainablePolicy):
             state_repeated = None
             if state is not None:
                 if isinstance(state, list):
-                    state = torch.stack(state)
-                state = state.to(device=last_hidden.device, dtype=last_hidden.dtype)
+                    if isinstance(state[0], torch.Tensor):
+                        state = torch.stack(state).to(device=last_hidden.device, dtype=last_hidden.dtype)
+                    else:
+                        state = torch.tensor(
+                            np.array(state), device=last_hidden.device, dtype=last_hidden.dtype,
+                        )
+                else:
+                    state = state.to(device=last_hidden.device, dtype=last_hidden.dtype)
                 state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
 
             vlm_output_repeated = {"hidden_states": last_hidden_repeated}
@@ -215,21 +270,21 @@ class Qwen35Gr00t(TrainablePolicy):
 
             output = self.action_model.forward(vlm_output_repeated, action_input)
 
-        # Loss composition
+        # Loss composition — aligned with starVLA QwenGR00TDynamic35
         if self.nfp_config is not None:
             action_loss = output["loss"]
-            result = {"raw_action_loss": action_loss}
-            loss = (
-                action_loss
-                if self.use_action_policy_loss
-                else torch.tensor(0.0, device=action_loss.device, requires_grad=True)
-            )
-            for k, v in nfp_losses.items():
-                result[k] = v
-                if "mse" in k:
-                    loss = loss + self.nfp_config.nfp_loss_mse_weight * v
-                else:
-                    loss = loss + self.nfp_config.nfp_loss_cosine_weight * v
+            loss_dict = {"raw_action_loss": action_loss}
+            if self.use_action_policy_loss:
+                loss = action_loss
+            else:
+                loss = 0.0
+
+            for i, (mse_loss, cosine_loss) in enumerate(zip(nfp_mse_loss, nfp_cosine_loss)):
+                loss += 0.1 * mse_loss + cosine_loss
+                loss_dict[f"nfp_mse_loss_{i}"] = mse_loss
+                loss_dict[f"nfp_cosine_loss_{i}"] = cosine_loss
+            loss_dict["action_loss"] = loss
+            result = loss_dict
             result["loss"] = loss
         else:
             result = {"loss": output["loss"]}
@@ -285,13 +340,24 @@ class Qwen35Gr00t(TrainablePolicy):
             f"[predict_action] last_hidden shape={last_hidden.shape} dtype={last_hidden.dtype}"
         )
 
-        # NFP feature for inference
+        # NFP feature for inference — aligned with starVLA QwenGR00TDynamic35.predict_action
         nfp_feature = None
         if self.nfp_config is not None:
             image_mask = qwen_inputs["input_ids"] == self.nfp_config.image_token_id
             nfp_input = last_hidden[image_mask]
-            nfp_outputs = self.nfp_head(nfp_input)
-            nfp_feature = nfp_outputs.reshape(last_hidden.shape[0], -1, nfp_outputs.shape[-1])
+            if self.nfp_head_num > 1:
+                nfp_feature = []
+                for i, head in enumerate(self.nfp_head):
+                    nfp_outputs = head(nfp_input)
+                    nfp_feature.append(nfp_outputs.reshape(last_hidden.shape[0], -1, nfp_outputs.shape[-1]))
+                action_condition_mode = getattr(self.nfp_config, "action_condition_mode", "concat")
+                if action_condition_mode == "gate":
+                    nfp_feature = self.nfp_head_gating(nfp_feature)
+                else:
+                    nfp_feature = torch.cat(nfp_feature, dim=1)
+            else:
+                nfp_outputs = self.nfp_head(nfp_input)
+                nfp_feature = nfp_outputs.reshape(last_hidden.shape[0], -1, nfp_outputs.shape[-1])
 
         if state is not None:
             state = state.to(device=last_hidden.device, dtype=last_hidden.dtype)
