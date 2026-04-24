@@ -67,6 +67,66 @@ class LeRobotDatasetWithFutureFrames(LeRobotDataset):
     ``{cam_key}_future`` keys, matching starVLA's naming convention.
     """
 
+    def load_hf_dataset(self):
+        """Load HF dataset with decode=False for image features, so we can
+        resolve relative paths against self.root before decoding."""
+        from flagscale.train.datasets.utils import get_hf_features_from_features, load_nested_dataset
+        import datasets as hf_datasets
+
+        features = get_hf_features_from_features(self.features)
+        # Disable auto-decoding for image columns
+        for key in features:
+            if isinstance(features[key], hf_datasets.Image):
+                features[key] = hf_datasets.Image(decode=False)
+
+        hf_dataset = load_nested_dataset(
+            self.root / "data", features=features, episodes=self.episodes
+        )
+
+        root = self.root
+        image_keys = [k for k, ft in self.features.items() if ft["dtype"] == "image"]
+
+        def _resolve_and_transform(items_dict):
+            from io import BytesIO
+            import PIL.Image as PILImage
+            from torchvision import transforms
+            to_tensor = transforms.ToTensor()
+
+            for key in list(items_dict.keys()):
+                values = items_dict[key]
+                if key in image_keys:
+                    decoded = []
+                    for v in values:
+                        if isinstance(v, dict):
+                            if v.get("bytes") is not None:
+                                img = PILImage.open(BytesIO(v["bytes"]))
+                            elif v.get("path") is not None:
+                                path = v["path"]
+                                if not os.path.isabs(path):
+                                    path = str(root / path)
+                                img = PILImage.open(path)
+                            else:
+                                raise ValueError(f"Image has neither bytes nor path: {v}")
+                            img.load()
+                            decoded.append(to_tensor(img))
+                        else:
+                            decoded.append(to_tensor(v) if not isinstance(v, torch.Tensor) else v)
+                    items_dict[key] = decoded
+                else:
+                    first = values[0]
+                    if first is None:
+                        pass
+                    elif isinstance(first, str):
+                        pass
+                    else:
+                        items_dict[key] = [
+                            x if isinstance(x, str) else torch.tensor(x) for x in values
+                        ]
+            return items_dict
+
+        hf_dataset.set_transform(_resolve_and_transform)
+        return hf_dataset
+
     def __getitem__(self, idx):
         item = super().__getitem__(idx)
         for cam_key in self.meta.camera_keys:
@@ -637,6 +697,7 @@ def main(config: TrainConfig, seed: int):
         dl_iter = iter(dataloader)
 
         vlm_dl_iter = None
+        vlm_sampler = None
         if getattr(config.data, "vlm_data_path", None):
             vlm_ds = get_train_dataset(
                 config.data.vlm_data_path,
@@ -706,6 +767,7 @@ def main(config: TrainConfig, seed: int):
         num_frames = dataset.num_frames
         num_episodes = dataset.num_episodes
         vlm_dl_iter = None
+        vlm_sampler = None
         if getattr(config.data, "vlm_data", None) is not None:
             # Set data root paths from YAML config before importing qwen_data_config
             vlm_data_cfg = config.data.vlm_data
@@ -727,8 +789,9 @@ def main(config: TrainConfig, seed: int):
                     qwenvl=SimpleNamespace(base_vlm=config.model.vlm.base_vlm)
                 ),
             )
-            vlm_data_module = make_vlm_dataloader(vlm_cfg)
+            vlm_data_module = make_vlm_dataloader(vlm_cfg, rank=rank, world_size=world_size, seed=seed)
             vlm_dl = vlm_data_module["train_dataloader"]
+            vlm_sampler = vlm_data_module["sampler"]
             vlm_dl_iter = cycle(vlm_dl)
 
     # --- Apply FSDP2 ---
