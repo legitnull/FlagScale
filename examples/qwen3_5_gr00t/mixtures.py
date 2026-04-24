@@ -6,6 +6,9 @@ The dataset_name is joined with data_root_dir at runtime to form the full path.
 """
 
 DATASET_MIXTURES: dict[str, list[tuple[str, float]]] = {
+    "yupu_test": [
+        ("0_30_s_academic_v0_1", 1.0),
+    ],
     "ego1": [
         ("EgoExoLearn_1fps", 1.0),
         ("GenEgoData", 1.0),

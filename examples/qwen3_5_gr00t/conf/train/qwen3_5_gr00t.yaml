@@ -107,9 +107,9 @@ data:
   tolerance_s: 0.02
 
   # Multi-dataset mixture (set data_mix to use, or leave null for single dataset via data_path)
-  # data_mix: ego1
-  # data_root_dir: /nfs/zhangqq/datasets/lerobot/vla_data
-  # balance_dataset_weights: true
+  data_mix: ego1
+  data_root_dir: /share/project/hotel/lerobot30_multiimage_data_1fps
+  balance_dataset_weights: true
   preprocessor:
     name: policy_preprocessor
     steps:
