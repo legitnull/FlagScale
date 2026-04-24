@@ -294,15 +294,6 @@ class DynamicFlowmatchingActionHead(nn.Module):
         """
         device = vl_embs.device
 
-        # Pad actions if needed
-        if actions.shape[-1] < self.action_dim:
-            padding = torch.zeros(
-                (*actions.shape[:-1], self.action_dim - actions.shape[-1]),
-                device=actions.device,
-                dtype=actions.dtype,
-            )
-            actions = torch.cat([actions, padding], dim=-1)
-
         # Flow matching noise
         noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
         t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
