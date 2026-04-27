@@ -629,9 +629,11 @@ def make_vlm_dataloader(cfg, rank: int, world_size: int, seed: int = 42):
 
     train_dataset = data_module["train_dataset"]
     data_collator = data_module["data_collator"]
-    from torch.utils.data import DataLoader, DistributedSampler
+    from torchdata.stateful_dataloader import StatefulDataLoader
 
-    sampler = DistributedSampler(
+    from flagscale.train.utils.train_utils import StatefulDistributedSampler
+
+    sampler = StatefulDistributedSampler(
         train_dataset,
         num_replicas=world_size,
         rank=rank,
@@ -640,7 +642,7 @@ def make_vlm_dataloader(cfg, rank: int, world_size: int, seed: int = 42):
         seed=seed,
     )
 
-    train_dataloader = DataLoader(
+    train_dataloader = StatefulDataLoader(
         train_dataset,
         batch_size=cfg.datasets.vlm_data.per_device_batch_size,
         collate_fn=data_collator,

@@ -5,7 +5,6 @@ import argparse
 import os
 import random
 import time
-from collections.abc import Iterator
 from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
@@ -43,18 +42,19 @@ from flagscale.train.utils.logging_utils import (
     format_big_number,
 )
 from flagscale.train.utils.train_utils import (
+    StatefulDistributedSampler,
     get_step_checkpoint_dir,
     load_training_state_fsdp2,
     save_checkpoint,
     update_last_checkpoint,
 )
-from flagscale.train.utils.random_utils import serialize_rng_state, deserialize_rng_state
 from flagscale.train.utils.optim_setup import setup_optimizer_and_scheduler
 from flagscale.models.vla import TrainablePolicy
 from flagscale.models.vla.pretrained_config import PreTrainedConfig
 from flagscale.models.vla.vlm.qwenvl_backbone import _to_pil
 from flagscale.platforms import get_platform
 from qwen_vl_utils import process_vision_info
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 
 class LeRobotDatasetWithFutureFrames(LeRobotDataset):
@@ -363,26 +363,6 @@ def _resolve_delta_timestamps(
     return delta_timestamps
 
 
-# datasets/utils.py
-def cycle(iterable: Any) -> Iterator[Any]:
-    """Create a dataloader-safe cyclical iterator.
-
-    This is an equivalent of `itertools.cycle` but is safe for use with
-    PyTorch DataLoaders with multiple workers.
-    See https://github.com/pytorch/pytorch/issues/23900 for details.
-
-    Args:
-        iterable: The iterable to cycle over.
-
-    Yields:
-        Items from the iterable, restarting from the beginning when exhausted.
-    """
-    iterator = iter(iterable)
-    while True:
-        try:
-            yield next(iterator)
-        except StopIteration:
-            iterator = iter(iterable)
 
 
 def format_train_tracker_step(train_tracker: MetricsTracker) -> str:
@@ -696,6 +676,7 @@ def main(config: TrainConfig, seed: int):
         dataloader = get_loader(ds)
         dl_iter = iter(dataloader)
 
+        vlm_dl = None
         vlm_dl_iter = None
         vlm_sampler = None
         if getattr(config.data, "vlm_data_path", None):
@@ -733,8 +714,7 @@ def main(config: TrainConfig, seed: int):
         num_workers = config.system.num_workers
         shuffle = config.system.shuffle
 
-        # DistributedSampler ensures each rank gets different data
-        sampler = torch.utils.data.distributed.DistributedSampler(
+        sampler = StatefulDistributedSampler(
             dataset,
             num_replicas=world_size,
             rank=rank,
@@ -750,7 +730,7 @@ def main(config: TrainConfig, seed: int):
             image_feature_keys=list(policy.image_features.keys()),
         )
 
-        dataloader = torch.utils.data.DataLoader(
+        dataloader = StatefulDataLoader(
             dataset,
             num_workers=num_workers,
             batch_size=config.system.batch_size,
@@ -762,10 +742,10 @@ def main(config: TrainConfig, seed: int):
             prefetch_factor=2 if num_workers > 0 else None,
         )
 
-
-        dl_iter = cycle(dataloader)
+        dl_iter = iter(dataloader)
         num_frames = dataset.num_frames
         num_episodes = dataset.num_episodes
+        vlm_dl = None
         vlm_dl_iter = None
         vlm_sampler = None
         if getattr(config.data, "vlm_data", None) is not None:
@@ -792,7 +772,7 @@ def main(config: TrainConfig, seed: int):
             vlm_data_module = make_vlm_dataloader(vlm_cfg, rank=rank, world_size=world_size, seed=seed)
             vlm_dl = vlm_data_module["train_dataloader"]
             vlm_sampler = vlm_data_module["sampler"]
-            vlm_dl_iter = cycle(vlm_dl)
+            vlm_dl_iter = iter(vlm_dl)
 
     # --- Apply FSDP2 ---
     device_mesh = init_device_mesh(get_platform().name(), (world_size,))
@@ -806,20 +786,20 @@ def main(config: TrainConfig, seed: int):
     step = 0
     resume_from = config.system.checkpoint.resume_from
     if resume_from:
-        step = load_training_state_fsdp2(
+        step, dl_state = load_training_state_fsdp2(
             Path(resume_from), policy, optimizer, lr_scheduler,
         )
-        # Advance the dataloader iterator to the correct position. The data
-        # ordering is deterministic from the DistributedSampler's own seed
-        # (not the global RNG), so calling next() `step` times moves the
-        # cursor to the right batch. We save/restore the global RNG around
-        # this so the fast-forward's incidental RNG consumption is discarded
-        # and training resumes with the exact RNG state from the checkpoint.
-        saved_rng = serialize_rng_state()
-        # TODO: (yupu) Maybe save/restore the dataloader state?
-        for _ in range(step):
-            next(dl_iter)
-        deserialize_rng_state(saved_rng)
+        if dl_state is not None:
+            if "vla" in dl_state:
+                dataloader.load_state_dict(dl_state["vla"])
+            if "vlm" in dl_state and vlm_dl is not None:
+                vlm_dl.load_state_dict(dl_state["vlm"])
+        epoch = sampler.epoch if sampler is not None else 0
+        if isinstance(dataset, LeRobotMixtureDataset):
+            dataset.set_epoch(epoch)
+        dl_iter = iter(dataloader)
+        if vlm_dl is not None:
+            vlm_dl_iter = iter(vlm_dl)
         logger.info(f"Resumed from checkpoint at step {step}")
 
     train_metrics = {
@@ -838,23 +818,14 @@ def main(config: TrainConfig, seed: int):
     effective_batch_size = config.system.batch_size * world_size
 
     train_tracker = MetricsTracker(
-        effective_batch_size,
+        config.system.batch_size,
         num_frames,
         num_episodes,
         train_metrics,
         initial_step=step,
     )
 
-    epoch = 0
-    if sampler is not None:
-        samples_per_epoch = num_frames // effective_batch_size
-        if resume_from and samples_per_epoch > 0:
-            epoch = step // samples_per_epoch
-        sampler.set_epoch(epoch)
-        if isinstance(dataset, LeRobotMixtureDataset):
-            dataset.set_epoch(epoch)
-    else:
-        samples_per_epoch = 0
+    epoch = sampler.epoch if sampler is not None else 0
 
     def _to_device(v, dev):
         if isinstance(v, torch.Tensor):
@@ -865,11 +836,29 @@ def main(config: TrainConfig, seed: int):
 
     for _ in range(step, config.system.train_steps):
         start_time = time.perf_counter()
-        batch = next(dl_iter)
+        try:
+            batch = next(dl_iter)
+        except StopIteration:
+            epoch += 1
+            if sampler is not None:
+                sampler.set_epoch(epoch)
+            if isinstance(dataset, LeRobotMixtureDataset):
+                dataset.set_epoch(epoch)
+            dl_iter = iter(dataloader)
+            batch = next(dl_iter)
         if isinstance(batch, dict):
             batch = {k: _to_device(v, device) for k, v in batch.items()}
 
-        vlm_batch = next(vlm_dl_iter) if vlm_dl_iter is not None else None
+        if vlm_dl_iter is not None:
+            try:
+                vlm_batch = next(vlm_dl_iter)
+            except StopIteration:
+                if vlm_sampler is not None:
+                    vlm_sampler.set_epoch(epoch)
+                vlm_dl_iter = iter(vlm_dl)
+                vlm_batch = next(vlm_dl_iter)
+        else:
+            vlm_batch = None
         if vlm_batch is not None:
             vlm_batch = {
                 k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
@@ -895,14 +884,6 @@ def main(config: TrainConfig, seed: int):
         step += 1
         train_tracker.step()
 
-        # Update epoch counter for sampler.set_epoch() when we've processed one epoch worth of samples
-        # This ensures proper data shuffling across epochs in distributed training
-        if sampler is not None and samples_per_epoch > 0 and step % samples_per_epoch == 0:
-            epoch += 1
-            sampler.set_epoch(epoch)
-            if isinstance(dataset, LeRobotMixtureDataset):
-                dataset.set_epoch(epoch)
-
         if step % config.system.log_freq == 0:
             logger.info(f"step: {step} {format_train_tracker_step(train_tracker)}")
             train_tracker.reset_averages()
@@ -924,6 +905,9 @@ def main(config: TrainConfig, seed: int):
                 checkpoint_dir = get_step_checkpoint_dir(
                     output_dir, config.system.train_steps, step
                 )
+                dl_state = {"vla": dataloader.state_dict()}
+                if vlm_dl is not None:
+                    dl_state["vlm"] = vlm_dl.state_dict()
                 save_checkpoint(
                     checkpoint_dir=checkpoint_dir,
                     step=step,
@@ -934,6 +918,7 @@ def main(config: TrainConfig, seed: int):
                     preprocessor=preprocessor,
                     postprocessor=postprocessor,
                     state_dict=state_dict,
+                    dataloader_state=dl_state,
                 )
                 update_last_checkpoint(checkpoint_dir)
 

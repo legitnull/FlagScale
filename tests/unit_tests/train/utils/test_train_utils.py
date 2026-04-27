@@ -25,6 +25,7 @@ from flagscale.models.utils.constants import (
     TRAINING_STEP,
 )
 from flagscale.train.utils.train_utils import (
+    StatefulDistributedSampler,
     get_step_checkpoint_dir,
     get_step_identifier,
     load_scheduler_state,
@@ -349,3 +350,87 @@ def _get_full_optim_sd(model, opt):
 
 #         opt2 = torch.optim.Adam(model.parameters(), lr=1e-3)
 #         load_optimizer_state_fsdp2(model, opt2, tmp_path)
+
+
+class TestStatefulDistributedSampler:
+    """Tests for StatefulDistributedSampler without requiring a real distributed env."""
+
+    def _make_sampler(self, dataset_size=20, num_replicas=2, rank=0, seed=42):
+        dataset = torch.utils.data.TensorDataset(torch.arange(dataset_size))
+        sampler = StatefulDistributedSampler(
+            dataset,
+            num_replicas=num_replicas,
+            rank=rank,
+            shuffle=True,
+            seed=seed,
+        )
+        sampler.set_epoch(0)
+        return sampler
+
+    def test_full_iteration_matches_parent(self):
+        sampler = self._make_sampler()
+        dataset = torch.utils.data.TensorDataset(torch.arange(20))
+        parent = torch.utils.data.distributed.DistributedSampler(
+            dataset,
+            num_replicas=2,
+            rank=0,
+            shuffle=True,
+            seed=42,
+        )
+        parent.set_epoch(0)
+
+        assert list(sampler) == list(parent)
+
+    def test_state_dict_initial(self):
+        sampler = self._make_sampler()
+        sd = sampler.state_dict()
+        assert sd == {"epoch": 0, "yielded": 0}
+
+    def test_resume_mid_epoch(self):
+        sampler = self._make_sampler()
+        all_indices = list(sampler)
+
+        sampler2 = self._make_sampler()
+        stop_at = 4
+        partial = []
+        for i, idx in enumerate(sampler2):
+            partial.append(idx)
+            if i + 1 == stop_at:
+                sd = sampler2.state_dict()
+                break
+
+        assert sd["yielded"] == stop_at
+
+        sampler3 = self._make_sampler()
+        sampler3.load_state_dict(sd)
+        remaining = list(sampler3)
+
+        assert partial + remaining == all_indices
+
+    def test_yielded_resets_after_full_pass(self):
+        sampler = self._make_sampler()
+        _ = list(sampler)
+        assert sampler._yielded == 0
+
+    def test_load_state_dict_sets_epoch(self):
+        sampler = self._make_sampler()
+        sampler.load_state_dict({"epoch": 5, "yielded": 3})
+        assert sampler.epoch == 5
+        assert sampler._yielded == 3
+
+    def test_different_epochs_give_different_order(self):
+        s0 = self._make_sampler(dataset_size=20, num_replicas=1, rank=0)
+        s0.set_epoch(0)
+        indices_e0 = list(s0)
+
+        s1 = self._make_sampler(dataset_size=20, num_replicas=1, rank=0)
+        s1.set_epoch(1)
+        indices_e1 = list(s1)
+
+        assert set(indices_e0) == set(indices_e1)
+        assert indices_e0 != indices_e1
+
+    def test_different_ranks_no_overlap(self):
+        s0 = self._make_sampler(num_replicas=2, rank=0)
+        s1 = self._make_sampler(num_replicas=2, rank=1)
+        assert set(s0) & set(s1) == set()
