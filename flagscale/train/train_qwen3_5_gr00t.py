@@ -7,40 +7,57 @@ import random
 import time
 from contextlib import nullcontext
 from functools import partial
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-from omegaconf import OmegaConf, DictConfig
+import datasets as hf_datasets
 import numpy as np
-from PIL import Image
+import PIL.Image as PILImage
 import torch
 import torch.distributed as dist
-from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+from omegaconf import DictConfig, OmegaConf
+from PIL import Image
+from qwen_vl_utils import process_vision_info
+from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_model_state_dict,
+    get_optimizer_state_dict,
+)
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.checkpoint.state_dict import get_model_state_dict, get_optimizer_state_dict, StateDictOptions
 from torch.optim import Optimizer
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 from flagscale.logger import logger
-from flagscale.train.train_config import TrainConfig, DataConfig
-from flagscale.train.datasets.lerobot_dataset import (
-    LeRobotDataset,
-    LeRobotDatasetMetadata,
-)
-from flagscale.train.datasets.lerobot_mixture_dataset import LeRobotMixtureDataset
-from flagscale.train.datasets.utils import dataset_to_policy_features
 from flagscale.models.configs.types import FeatureType
-from flagscale.train.processor import PolicyProcessorPipeline
 from flagscale.models.utils.constants import (
     ACTION,
     OBS_PREFIX,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
+from flagscale.models.vla import TrainablePolicy
+from flagscale.models.vla.pretrained_config import PreTrainedConfig
+from flagscale.platforms import get_platform
+from flagscale.train.datasets.lerobot_dataset import (
+    LeRobotDataset,
+    LeRobotDatasetMetadata,
+)
+from flagscale.train.datasets.lerobot_mixture_dataset import LeRobotMixtureDataset
+from flagscale.train.datasets.utils import (
+    dataset_to_policy_features,
+    get_hf_features_from_features,
+    load_nested_dataset,
+)
+from flagscale.train.processor import PolicyProcessorPipeline
+from flagscale.train.train_config import TrainConfig
 from flagscale.train.utils.logging_utils import (
     AverageMeter,
     MetricsTracker,
     format_big_number,
 )
+from flagscale.train.utils.optim_setup import setup_optimizer_and_scheduler
 from flagscale.train.utils.train_utils import (
     StatefulDistributedSampler,
     get_step_checkpoint_dir,
@@ -48,13 +65,6 @@ from flagscale.train.utils.train_utils import (
     save_checkpoint,
     update_last_checkpoint,
 )
-from flagscale.train.utils.optim_setup import setup_optimizer_and_scheduler
-from flagscale.models.vla import TrainablePolicy
-from flagscale.models.vla.pretrained_config import PreTrainedConfig
-from flagscale.models.vla.vlm.qwenvl_backbone import _to_pil
-from flagscale.platforms import get_platform
-from qwen_vl_utils import process_vision_info
-from torchdata.stateful_dataloader import StatefulDataLoader
 
 
 class LeRobotDatasetWithFutureFrames(LeRobotDataset):
@@ -64,14 +74,16 @@ class LeRobotDatasetWithFutureFrames(LeRobotDataset):
     returns tensors with an extra time dimension (e.g. [T, C, H, W] for video,
     [T, C, H, W] for image via _query_hf_dataset). This subclass splits them into
     current frame (index 0) under the original key and future frames under
-    ``{cam_key}_future`` keys, matching starVLA's naming convention.
+    ``{cam_key}_future`` keys.
     """
 
-    def load_hf_dataset(self):
-        """Load HF dataset with decode=False for image features, so we can
-        resolve relative paths against self.root before decoding."""
-        from flagscale.train.datasets.utils import get_hf_features_from_features, load_nested_dataset
-        import datasets as hf_datasets
+    def load_hf_dataset(self) -> hf_datasets.Dataset:
+        """Override base to keep images as PIL (base converts to tensor via hf_transform_to_torch).
+
+        Uses decode=False so we can resolve relative image paths against self.root.
+        See LeRobotDataset.__getitem__ (lerobot_dataset.py:1061) for the call chain:
+        hf_dataset[idx] → _query_hf_dataset → _query_videos → image_transforms.
+        """
 
         features = get_hf_features_from_features(self.features)
         # Disable auto-decoding for image columns
@@ -84,13 +96,11 @@ class LeRobotDatasetWithFutureFrames(LeRobotDataset):
         )
 
         root = self.root
-        image_keys = [k for k, ft in self.features.items() if ft["dtype"] == "image"]
+        image_keys = set(self.meta.image_keys)
 
-        def _resolve_and_transform(items_dict):
-            from io import BytesIO
-            import PIL.Image as PILImage
-            from torchvision import transforms
-            to_tensor = transforms.ToTensor()
+        def _resolve_and_transform(items_dict: dict[str, list]) -> dict:
+            """set_transform callback — HF calls this on every hf_dataset access.
+            Decodes image dicts to PIL; converts other columns to tensors."""
 
             for key in list(items_dict.keys()):
                 values = items_dict[key]
@@ -108,9 +118,14 @@ class LeRobotDatasetWithFutureFrames(LeRobotDataset):
                             else:
                                 raise ValueError(f"Image has neither bytes nor path: {v}")
                             img.load()
-                            decoded.append(to_tensor(img))
+                            decoded.append(img)
+                        elif isinstance(v, Image.Image):
+                            decoded.append(v)
                         else:
-                            decoded.append(to_tensor(v) if not isinstance(v, torch.Tensor) else v)
+                            logger.warning(
+                                f"Unexpected type {type(v)} for image key '{key}', passing through"
+                            )
+                            decoded.append(v)
                     items_dict[key] = decoded
                 else:
                     first = values[0]
@@ -127,17 +142,85 @@ class LeRobotDatasetWithFutureFrames(LeRobotDataset):
         hf_dataset.set_transform(_resolve_and_transform)
         return hf_dataset
 
-    def __getitem__(self, idx):
+    def _query_hf_dataset(self, query_indices: dict[str, list[int]]) -> dict:
+        """Override base to return list[PIL.Image] for image keys instead of torch.stack().
+        Video keys are skipped — they come from _query_videos (mp4 decoding)."""
+        image_keys = set(self.meta.image_keys)
+        non_image_indices = {k: v for k, v in query_indices.items() if k not in image_keys}
+        result = super()._query_hf_dataset(non_image_indices)
+
+        for key, q_idx in query_indices.items():
+            if key not in image_keys:
+                continue
+            if key in self.meta.video_keys:
+                continue
+            relative_indices = (
+                q_idx
+                if self._absolute_to_relative_idx is None
+                else [self._absolute_to_relative_idx[idx] for idx in q_idx]
+            )
+            result[key] = list(self.hf_dataset[key][relative_indices])
+        return result
+
+    @staticmethod
+    def _tensor_to_pil(t: torch.Tensor) -> Image.Image:
+        """Convert a CHW float32 [0,1] tensor to a PIL Image."""
+        return Image.fromarray(
+            (t.permute(1, 2, 0) * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
+        )
+
+    def __getitem__(self, idx) -> dict:
+        """Split multi-frame camera values into current + future keys.
+        After super().__getitem__: image keys are list[PIL], video keys are [T,C,H,W] tensors."""
         item = super().__getitem__(idx)
         for cam_key in self.meta.camera_keys:
-            if cam_key in item and item[cam_key].dim() >= 4:
-                item[f"{cam_key}_future"] = item[cam_key][1]
-                item[cam_key] = item[cam_key][0]
+            if cam_key not in item:
+                continue
+            val = item[cam_key]
+            # PIL list (image keys with delta_timestamps)
+            if isinstance(val, list) and len(val) > 1:
+                item[f"{cam_key}_future"] = val[1]
+                item[cam_key] = val[0]
+            # Tensor (video keys with delta_timestamps)
+            elif isinstance(val, torch.Tensor) and val.dim() >= 4:
+                item[f"{cam_key}_future"] = self._tensor_to_pil(val[1])
+                item[cam_key] = self._tensor_to_pil(val[0])
+            # Single-frame video tensor
+            elif isinstance(val, torch.Tensor) and val.dim() == 3:
+                item[cam_key] = self._tensor_to_pil(val)
         return item
 
 
-def qwen_collate_fn(batch_list, *, processor, prompt_template, image_feature_keys):
-    batch = torch.utils.data.default_collate(batch_list)
+def qwen_collate_fn(
+    batch_list: list[dict],
+    *,
+    processor,
+    prompt_template: str,
+    image_feature_keys: list[str],
+) -> dict:
+    """Collate samples into a batch with tokenized Qwen processor inputs.
+
+    PIL images can't go through default_collate, so we pull them out first,
+    collate the rest (action, state, etc.), then build Qwen inputs from the
+    PIL images + task instructions.
+
+    Adds ``qwen_inputs`` and (if future frames exist) ``qwen_future_inputs``
+    to the batch dict.
+    """
+    future_keys = [f"{k}_future" for k in image_feature_keys]
+    all_image_keys = set(image_feature_keys) | set(future_keys)
+
+    # Separate PIL images from tensor-compatible fields
+    image_data: dict[str, list[Image.Image]] = {}
+    for key in all_image_keys:
+        if key in batch_list[0]:
+            image_data[key] = [sample[key] for sample in batch_list]
+
+    non_image_batch = [
+        {k: v for k, v in sample.items() if k not in all_image_keys} for sample in batch_list
+    ]
+    batch = torch.utils.data.default_collate(non_image_batch)
+    batch.update(image_data)
 
     instructions = batch["task"]
     if isinstance(instructions, torch.Tensor):
@@ -145,33 +228,49 @@ def qwen_collate_fn(batch_list, *, processor, prompt_template, image_feature_key
     if isinstance(instructions, str):
         instructions = [instructions]
 
-    def _build_inputs(feature_keys):
-        batch_images = None
+    def _build_inputs(feature_keys: list[str]):
+        """Build Qwen processor inputs from PIL images across camera keys.
+
+        Groups images per sample: [[cam1, cam2, ...], [cam1, cam2, ...], ...]
+        then formats as Qwen chat messages for tokenization.
+        """
+        batch_images: list[list[Image.Image]] | None = None
         for key in feature_keys:
             imgs = batch[key]
-            if isinstance(imgs, torch.Tensor) and imgs.ndim == 3:
+            if not isinstance(imgs, list):
                 imgs = [imgs]
-            key_images = [_to_pil(img) for img in imgs]
             if batch_images is None:
-                batch_images = [[img] for img in key_images]
+                batch_images = [[img] for img in imgs]
             else:
-                for sample_imgs, img in zip(batch_images, key_images):
+                for sample_imgs, img in zip(batch_images, imgs):
                     sample_imgs.append(img)
 
         messages = []
         for imgs, instruction in zip(batch_images, instructions):
             content = [{"type": "image", "image": img} for img in imgs]
-            prompt = prompt_template.replace("{instruction}", instruction) if prompt_template else instruction
+            prompt = (
+                prompt_template.replace("{instruction}", instruction)
+                if prompt_template
+                else instruction
+            )
             content.append({"type": "text", "text": prompt})
             messages.append([{"role": "user", "content": content}])
 
-        texts = [processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True) for m in messages]
+        # NOTE: apply_chat_template(tokenize=True) is simpler but uses the processor's
+        # min/max_pixels config for resizing, which differs from process_vision_info's
+        # qwen_vl_utils defaults (e.g. 256x256 → 252x252 vs different size). Sticking
+        # with the 3-step API for now.
+        texts = [
+            processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True)
+            for m in messages
+        ]
         image_inputs, video_inputs = process_vision_info(messages)
-        return processor(text=texts, images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt")
+        return processor(
+            text=texts, images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt"
+        )
 
     batch["qwen_inputs"] = _build_inputs(image_feature_keys)
 
-    future_keys = [f"{k}_future" for k in image_feature_keys]
     if future_keys and future_keys[0] in batch:
         batch["qwen_future_inputs"] = _build_inputs(future_keys)
 
@@ -222,30 +321,13 @@ def _resolve_video_backend():
     if get_platform().name() == "cuda":
         try:
             import torchcodec  # noqa: F401
-            torch.ops.torchcodec_ns  # verify the C++ ops are loadable
+
+            _ = torch.ops.torchcodec_ns  # verify the C++ ops are loadable
             video_backend = "torchcodec"
         except Exception:
-            logger.info("torchcodec unavailable, falling back to pyav")
+            logger.warning("torchcodec unavailable, falling back to pyav")
             video_backend = "pyav"
     return video_backend
-
-
-def _make_image_transforms():
-    def _resize_to_uint8_hwc(frame: torch.Tensor) -> torch.Tensor:
-        """float32 CHW [0,1] from torchcodec → uint8 HWC 224x224 via PIL resize."""
-        if frame.dim() == 4:
-            # delta_timestamps adds a leading T dim; squeeze single-frame case
-            if frame.shape[0] == 1:
-                frame = frame.squeeze(0)
-            else:
-                return torch.stack([_resize_to_uint8_hwc(f) for f in frame])
-
-        frame_uint8 = (frame.permute(1, 2, 0) * 255).round().clamp(0, 255).to(torch.uint8)
-        # PIL default is BICUBIC, matching starVLA's Image.fromarray(image).resize((224, 224))
-        pil = Image.fromarray(frame_uint8.cpu().numpy()).resize((224, 224))
-        return torch.from_numpy(np.array(pil))
-
-    return _resize_to_uint8_hwc
 
 
 def _make_single_dataset(
@@ -285,7 +367,6 @@ def make_dataset(config: TrainConfig, policy_config: PreTrainedConfig, seed: int
     future_offset = getattr(config.data, "future_offset", None)
     data_mix = getattr(config.data, "data_mix", None)
     video_backend = _resolve_video_backend()
-    image_transforms = _make_image_transforms()
 
     if data_mix is not None:
         data_root_dir = getattr(config.data, "data_root_dir", None)
@@ -293,16 +374,23 @@ def make_dataset(config: TrainConfig, policy_config: PreTrainedConfig, seed: int
             raise ValueError("data_root_dir must be set when using data_mix")
 
         from examples.qwen3_5_gr00t.mixtures import DATASET_MIXTURES
+
         if data_mix not in DATASET_MIXTURES:
-            raise ValueError(f"Unknown data_mix: {data_mix}. Available: {list(DATASET_MIXTURES.keys())}")
+            raise ValueError(
+                f"Unknown data_mix: {data_mix}. Available: {list(DATASET_MIXTURES.keys())}"
+            )
 
         mixture_spec = DATASET_MIXTURES[data_mix]
         data_mixture = []
         for dataset_name, weight in mixture_spec:
             data_path = f"{data_root_dir}/{dataset_name}"
             ds = _make_single_dataset(
-                data_path, policy_config, future_offset, config.data.tolerance_s,
-                video_backend=video_backend, image_transforms=image_transforms,
+                data_path,
+                policy_config,
+                future_offset,
+                config.data.tolerance_s,
+                video_backend=video_backend,
+                image_transforms=None,
             )
             data_mixture.append((ds, weight))
 
@@ -315,8 +403,12 @@ def make_dataset(config: TrainConfig, policy_config: PreTrainedConfig, seed: int
         )
     else:
         dataset = _make_single_dataset(
-            config.data.data_path, policy_config, future_offset, config.data.tolerance_s,
-            video_backend=video_backend, image_transforms=image_transforms,
+            config.data.data_path,
+            policy_config,
+            future_offset,
+            config.data.tolerance_s,
+            video_backend=video_backend,
+            image_transforms=None,
         )
 
     return dataset
@@ -363,8 +455,6 @@ def _resolve_delta_timestamps(
     return delta_timestamps
 
 
-
-
 def format_train_tracker_step(train_tracker: MetricsTracker) -> str:
     def _format_meter_val(meter: AverageMeter) -> str:
         fmt = meter.fmt[1:] if meter.fmt.startswith(":") else meter.fmt
@@ -378,7 +468,6 @@ def format_train_tracker_step(train_tracker: MetricsTracker) -> str:
         *[_format_meter_val(m) for m in train_tracker.metrics.values()],
     ]
     return " ".join(display_list)
-
 
 
 def make_pre_post_processors(
@@ -587,7 +676,9 @@ def update_policy(
     optimizer.zero_grad()
 
     autocast_context = (
-        torch.amp.autocast(get_platform().amp_device_type(), dtype=torch.bfloat16) if use_amp else nullcontext()
+        torch.amp.autocast(get_platform().amp_device_type(), dtype=torch.bfloat16)
+        if use_amp
+        else nullcontext()
     )
 
     with autocast_context:
@@ -601,7 +692,9 @@ def update_policy(
         vlm_loss_scaled = vlm_loss_scale * output["vlm_loss"]
         vlm_loss_scaled.backward()
 
-    loss = vla_loss.detach() + (vlm_loss_scale * output["vlm_loss"].detach() if "vlm_loss" in output else 0.0)
+    loss = vla_loss.detach() + (
+        vlm_loss_scale * output["vlm_loss"].detach() if "vlm_loss" in output else 0.0
+    )
 
     # Clip gradients (torch.nn.utils.clip_grad_norm_ works with DTensors in PyTorch ≥2.6)
     grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -620,8 +713,13 @@ def update_policy(
         policy.update()
 
     train_metrics.loss = loss.item()
-    train_metrics.grad_norm = grad_norm.full_tensor().item() if hasattr(grad_norm, 'full_tensor') else grad_norm.item()
-    train_metrics.lr = next((g["lr"] for g in optimizer.param_groups if g.get("name") == "vlm"), optimizer.param_groups[0]["lr"])
+    train_metrics.grad_norm = (
+        grad_norm.full_tensor().item() if hasattr(grad_norm, "full_tensor") else grad_norm.item()
+    )
+    train_metrics.lr = next(
+        (g["lr"] for g in optimizer.param_groups if g.get("name") == "vlm"),
+        optimizer.param_groups[0]["lr"],
+    )
     train_metrics.update_s = time.perf_counter() - start_time
     if "raw_action_loss" in output and "action_loss" in train_metrics.metrics:
         train_metrics.action_loss = output["raw_action_loss"].item()
@@ -649,7 +747,8 @@ def main(config: TrainConfig, seed: int):
     is_main_process = rank == 0
 
     if config.data.dataset_type == "wds":
-        from megatron.energon import get_train_dataset, get_loader, WorkerConfig
+        from megatron.energon import WorkerConfig, get_loader, get_train_dataset
+
         from flagscale.models.vla.qwen3_5_gr00t import Qwen35Gr00tConfig
         from flagscale.models.vla.qwen_gr00t.task_encoder_qwen_gr00t import TaskEncoder
 
@@ -706,9 +805,16 @@ def main(config: TrainConfig, seed: int):
         policy = make_policy(policy_config, dataset.meta)
         dist.barrier()
 
-        dataset_stats = dataset.merged_stats if isinstance(dataset, LeRobotMixtureDataset) else dataset.meta.stats
+        dataset_stats = (
+            dataset.merged_stats
+            if isinstance(dataset, LeRobotMixtureDataset)
+            else dataset.meta.stats
+        )
         preprocessor, postprocessor = make_pre_post_processors(
-            policy, config.data, dataset_stats=dataset_stats, device=device.type,
+            policy,
+            config.data,
+            dataset_stats=dataset_stats,
+            device=device.type,
         )
 
         num_workers = config.system.num_workers
@@ -760,8 +866,9 @@ def main(config: TrainConfig, seed: int):
                 if val is not None:
                     os.environ[env_key] = str(val)
 
-            from flagscale.train.datasets.vlm_datasets_qwen35 import make_vlm_dataloader
             from types import SimpleNamespace
+
+            from flagscale.train.datasets.vlm_datasets_qwen35 import make_vlm_dataloader
 
             vlm_cfg = SimpleNamespace(
                 datasets=SimpleNamespace(vlm_data=config.data.vlm_data),
@@ -769,7 +876,9 @@ def main(config: TrainConfig, seed: int):
                     qwenvl=SimpleNamespace(base_vlm=config.model.vlm.base_vlm)
                 ),
             )
-            vlm_data_module = make_vlm_dataloader(vlm_cfg, rank=rank, world_size=world_size, seed=seed)
+            vlm_data_module = make_vlm_dataloader(
+                vlm_cfg, rank=rank, world_size=world_size, seed=seed
+            )
             vlm_dl = vlm_data_module["train_dataloader"]
             vlm_sampler = vlm_data_module["sampler"]
             vlm_dl_iter = iter(vlm_dl)
@@ -787,7 +896,10 @@ def main(config: TrainConfig, seed: int):
     resume_from = config.system.checkpoint.resume_from
     if resume_from:
         step, dl_state = load_training_state_fsdp2(
-            Path(resume_from), policy, optimizer, lr_scheduler,
+            Path(resume_from),
+            policy,
+            optimizer,
+            lr_scheduler,
         )
         if dl_state is not None:
             if "vla" in dl_state:
@@ -814,8 +926,6 @@ def main(config: TrainConfig, seed: int):
     }
     if vlm_dl_iter is not None:
         train_metrics["vlm_loss"] = AverageMeter("vlm_loss", ":.3f")
-
-    effective_batch_size = config.system.batch_size * world_size
 
     train_tracker = MetricsTracker(
         config.system.batch_size,
