@@ -5,6 +5,7 @@ import argparse
 import os
 import random
 import time
+from collections.abc import Mapping
 from contextlib import nullcontext
 from functools import partial
 from io import BytesIO
@@ -273,6 +274,12 @@ def qwen_collate_fn(
 
     if future_keys and future_keys[0] in batch:
         batch["qwen_future_inputs"] = _build_inputs(future_keys)
+
+    # Remove raw PIL images — they've been consumed by the processor above.
+    # Leaving them would break downstream steps (e.g. normalize_processor)
+    # that expect tensors.
+    for key in all_image_keys:
+        batch.pop(key, None)
 
     return batch
 
@@ -940,7 +947,8 @@ def main(config: TrainConfig, seed: int):
     def _to_device(v, dev):
         if isinstance(v, torch.Tensor):
             return v.to(dev, non_blocking=True)
-        if isinstance(v, dict):
+        # BatchEncoding (from HF processor) is a UserDict, not a dict
+        if isinstance(v, Mapping):
             return {k: _to_device(val, dev) for k, val in v.items()}
         return v
 

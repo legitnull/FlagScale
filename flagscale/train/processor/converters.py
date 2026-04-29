@@ -147,7 +147,10 @@ def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
     """
     Extract complementary data from a batch dictionary.
 
-    This includes padding flags, task description, and indices.
+    Collects every key that isn't already mapped to a dedicated transition
+    field (observation.*, action, next.reward, next.done, next.truncated,
+    info).  This allows arbitrary extra keys (e.g. qwen_inputs) to survive
+    the batch → EnvTransition → batch round-trip without being registered.
 
     Args:
         batch: The batch dictionary.
@@ -155,12 +158,10 @@ def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
     Returns:
         A dictionary with the extracted complementary data.
     """
-    pad_keys = {k: v for k, v in batch.items() if "_is_pad" in k}
-    task_key = {"task": batch["task"]} if "task" in batch else {}
-    index_key = {"index": batch["index"]} if "index" in batch else {}
-    task_index_key = {"task_index": batch["task_index"]} if "task_index" in batch else {}
-
-    return {**pad_keys, **task_key, **index_key, **task_index_key}
+    _TRANSITION_KEYS = {ACTION, REWARD, DONE, TRUNCATED, "info"}
+    return {
+        k: v for k, v in batch.items() if k not in _TRANSITION_KEYS and not k.startswith(OBS_PREFIX)
+    }
 
 
 def create_transition(
