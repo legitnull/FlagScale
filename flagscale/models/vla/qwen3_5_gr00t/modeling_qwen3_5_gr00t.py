@@ -128,9 +128,7 @@ class Qwen35Gr00t(TrainablePolicy):
         if skip_vla:
             result = {"loss": torch.tensor(0.0, device=next(self.parameters()).device, requires_grad=True)}
             if vlm_batch is not None:
-                with torch.autocast(get_platform().amp_device_type(), dtype=torch.bfloat16):
-                    vlm_loss = self.vlm.model(**vlm_batch, return_dict=True).loss
-                result["vlm_loss"] = vlm_loss
+                result["vlm_loss"] = self.forward_vlm(vlm_batch)
             return result
 
         if isinstance(batch, list):  # wds: list of per-sample dicts
@@ -289,12 +287,16 @@ class Qwen35Gr00t(TrainablePolicy):
         else:
             result = {"loss": output["loss"]}
 
-        if vlm_batch is not None:
-            with torch.autocast(get_platform().amp_device_type(), dtype=torch.bfloat16):
-                vlm_loss = self.vlm.model(**vlm_batch, return_dict=True).loss
-            result["vlm_loss"] = vlm_loss
-
         return result
+
+    def forward_vlm(self, vlm_batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Separate VLM co-train forward, called after VLA backward to reduce peak memory."""
+        device = next(self.parameters()).device
+        vlm_batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+                     for k, v in vlm_batch.items()}
+        with torch.autocast(get_platform().amp_device_type(), dtype=torch.bfloat16):
+            vlm_loss = self.vlm.model(**vlm_batch, return_dict=True).loss
+        return vlm_loss
 
     @torch.inference_mode()
     def predict_action(self, batch: list[dict] | dict) -> dict:
