@@ -187,7 +187,7 @@ def set_seed(seed: int):
         torch.backends.cudnn.enabled = True
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = False
-        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cuda.matmul.allow_tf32 = True
 
 
 def apply_fsdp2(policy, device_mesh):
@@ -591,15 +591,20 @@ def update_policy(
     )
 
     with autocast_context:
-        output = policy(batch, vlm_batch=vlm_batch, skip_vla=skip_vla)
+        output = policy(batch, vlm_batch=None, skip_vla=skip_vla)
         vla_loss = output["loss"]
 
     if not skip_vla:
+        if vlm_batch is not None:
+            policy.set_is_last_backward(False)
         vla_loss.backward()
 
-    if "vlm_loss" in output:
-        vlm_loss_scaled = vlm_loss_scale * output["vlm_loss"]
+    if vlm_batch is not None:
+        policy.set_is_last_backward(True)
+        vlm_output = policy(batch, vlm_batch=vlm_batch, skip_vla=True)
+        vlm_loss_scaled = vlm_loss_scale * vlm_output["vlm_loss"]
         vlm_loss_scaled.backward()
+        output["vlm_loss"] = vlm_output["vlm_loss"]
 
     loss = vla_loss.detach() + (vlm_loss_scale * output["vlm_loss"].detach() if "vlm_loss" in output else 0.0)
 

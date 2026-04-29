@@ -649,6 +649,7 @@ def make_vlm_dataloader(cfg, rank: int, world_size: int, seed: int = 42):
         num_workers=4,
         shuffle=False,  # Must be False when using sampler
         sampler=sampler,
+        pin_memory=True,
     )
 
     return {
