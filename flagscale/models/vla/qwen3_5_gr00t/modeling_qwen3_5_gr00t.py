@@ -121,16 +121,12 @@ class Qwen35Gr00t(TrainablePolicy):
         cosine_loss = cosine_loss.sum() / (nfp_outputs.shape[0] + 1e-12)
         return mse_loss, cosine_loss
 
-    def forward(
-        self, batch: list[dict] | dict, vlm_batch: dict[str, torch.Tensor] | None = None, skip_vla: bool = False
-    ) -> dict[str, torch.Tensor]:
-        """ """
-        if skip_vla:
-            result = {"loss": torch.tensor(0.0, device=next(self.parameters()).device, requires_grad=True)}
-            if vlm_batch is not None:
-                result["vlm_loss"] = self.forward_vlm(vlm_batch)
-            return result
+    def forward(self, batch: list[dict] | dict, mode: str = "vla") -> dict[str, torch.Tensor]:
+        if mode == "vlm":
+            return {"vlm_loss": self.forward_vlm(batch)}
+        return self.forward_vla(batch)
 
+    def forward_vla(self, batch: list[dict] | dict) -> dict[str, torch.Tensor]:
         if isinstance(batch, list):  # wds: list of per-sample dicts
             images = [ex["image"] for ex in batch]
             instructions = [ex["lang"] for ex in batch]

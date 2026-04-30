@@ -679,7 +679,6 @@ def update_policy(
     """
     start_time = time.perf_counter()
 
-    skip_vla = False  # Set to False to enable VLA forward+backward
     optimizer.zero_grad()
 
     autocast_context = (
@@ -689,24 +688,19 @@ def update_policy(
     )
 
     with autocast_context:
-        output = policy(batch, vlm_batch=None, skip_vla=skip_vla)
+        output = policy(batch)
         vla_loss = output["loss"]
 
-    if not skip_vla:
-        if vlm_batch is not None:
-            policy.set_is_last_backward(False)
-        vla_loss.backward()
+    if vlm_batch is not None:
+        policy.set_is_last_backward(False)
+    vla_loss.backward()
 
     if vlm_batch is not None:
         policy.set_is_last_backward(True)
-        vlm_output = policy(batch, vlm_batch=vlm_batch, skip_vla=True)
+        vlm_output = policy(vlm_batch, mode="vlm")
         vlm_loss_scaled = vlm_loss_scale * vlm_output["vlm_loss"]
         vlm_loss_scaled.backward()
         output["vlm_loss"] = vlm_output["vlm_loss"]
-
-    loss = vla_loss.detach() + (
-        vlm_loss_scale * output["vlm_loss"].detach() if "vlm_loss" in output else 0.0
-    )
 
     # Clip gradients (torch.nn.utils.clip_grad_norm_ works with DTensors in PyTorch ≥2.6)
     grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -724,7 +718,6 @@ def update_policy(
     if has_method(policy, "update"):
         policy.update()
 
-    train_metrics.loss = loss.item()
     train_metrics.grad_norm = (
         grad_norm.full_tensor().item() if hasattr(grad_norm, "full_tensor") else grad_norm.item()
     )
@@ -927,7 +920,6 @@ def main(config: TrainConfig, seed: int):
         logger.info(f"Resumed from checkpoint at step {step}")
 
     train_metrics = {
-        "loss": AverageMeter("loss", ":.3f"),
         "action_loss": AverageMeter("act_loss", ":.3f"),
         "nfp_mse_loss": AverageMeter("nfp_mse", ":.4f"),
         "nfp_cosine_loss": AverageMeter("nfp_cos", ":.4f"),

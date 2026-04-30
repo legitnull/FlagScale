@@ -646,10 +646,11 @@ def make_vlm_dataloader(cfg, rank: int, world_size: int, seed: int = 42):
         train_dataset,
         batch_size=cfg.datasets.vlm_data.per_device_batch_size,
         collate_fn=data_collator,
-        num_workers=4,
+        num_workers=8,
         shuffle=False,  # Must be False when using sampler
         sampler=sampler,
         pin_memory=True,
+        prefetch_factor=4,
     )
 
     return {
