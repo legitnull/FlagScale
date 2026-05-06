@@ -175,6 +175,31 @@ YOUTUBE_MC_30_60_S = {
     "data_path": f"{video_data_root}/30_60_s_youtube_v0_1/",
 }
 
+CAMBRIAN_S_3M = {
+    "annotation_path": f"{vlm_data_root}/cambrian_s_3m_dir.filtered.jsonl",
+    "data_path": f"{video_data_root}/CambrianS-3M/",
+}
+
+CAMBRIAN_10M = {
+    "annotation_path": f"{vlm_data_root}/Cambrian7M_prompt_unique.filtered.jsonl",
+    "data_path": f"{video_data_root}/Cambrian-10M/",
+}
+
+VSI_590K = {
+    "annotation_path": f"{vlm_data_root}/vsi_590k_video_374148.filtered.jsonl",
+    "data_path": f"{video_data_root}/VSI_590K/",
+}
+
+VSI_590K_SPATIAL = {
+    "annotation_path": f"{vlm_data_root}/vsi_590k_image_216519.filtered.jsonl",
+    "data_path": f"{video_data_root}/VSI_590K/",
+}
+
+LLAVA_HOUND = {
+    "annotation_path": f"{vlm_data_root}/llavahound.filtered.jsonl",
+    "data_path": f"{video_data_root}/llava-hound/",
+}
+
 data_dict = {
     "honeydata": HONEYDATA,
     "llavav15_lrv": LLAVAV15_LRV,
@@ -195,9 +220,7 @@ data_dict = {
     "nextqa_30_60_s": NEXTQA_30_60_S,
     "perceptiontest_30_60_s": PERCEPTIONTEST_30_60_S,
     "youtube_30_60_s": YOUTUBE_30_60_S,
-    ### 新增：0_30_s_academic (oe) ###
     "academic_0_30_s": ACADEMIC_0_30_S,
-    ### 新增：所有 mc 数据集 ###
     "academic_mc_0_30_s": ACADEMIC_MC_0_30_S,
     "nextqa_mc_0_30_s": NEXTQA_MC_0_30_S,
     "youtube_mc_0_30_s": YOUTUBE_MC_0_30_S,
@@ -210,6 +233,11 @@ data_dict = {
     "academic_mc_30_60_s": ACADEMIC_MC_30_60_S,
     "nextqa_mc_30_60_s": NEXTQA_MC_30_60_S,
     "youtube_mc_30_60_s": YOUTUBE_MC_30_60_S,
+    "cambrian_s_3m": CAMBRIAN_S_3M,
+    "cambrian_10m": CAMBRIAN_10M,
+    "vsi_590k": VSI_590K,
+    "vsi_590k_spatial": VSI_590K_SPATIAL,
+    "llava_hound": LLAVA_HOUND,
 }
 
 def parse_sampling_rate(dataset_name):
