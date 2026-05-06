@@ -12,7 +12,7 @@ DATASET_MIXTURES: dict[str, list[tuple[str, float]]] = {
     "ego1": [
         ("EgoExoLearn_1fps", 1.0),
         ("GenEgoData", 1.0),
-        ("0_30_s_NextQA", 1.0),
+        ("0_30_s_nextqa", 1.0),
         ("0_30_s_academic_v0_1", 1.0),
         ("0_30_s_activitynetqa", 1.0),
         ("0_30_s_youtube_v0_1", 1.0),
@@ -28,6 +28,7 @@ DATASET_MIXTURES: dict[str, list[tuple[str, float]]] = {
         ("30_60_s_activitynetqa", 1.0),
         ("30_60_s_nextqa", 1.0),
         ("30_60_s_youtube_v0_1", 1.0),
-        ("egodex_1fps", 1.0),
+        ("egodex_1fps_refreshed", 1.0),
+        ("something_something_v2", 1.0)
     ],
 }
