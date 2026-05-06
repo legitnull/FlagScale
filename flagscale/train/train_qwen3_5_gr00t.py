@@ -337,6 +337,25 @@ def _resolve_video_backend():
     return video_backend
 
 
+def _make_image_transforms():
+    def _resize_to_pil(img):
+        """Resize to 256×256 PIL. Accepts PIL, tensor, or list of either."""
+        if isinstance(img, list):
+            return [_resize_to_pil(i) for i in img]
+        if isinstance(img, Image.Image):
+            return img.resize((256, 256))
+        # Tensor from _query_videos: float32 CHW [0,1] or [T, C, H, W]
+        if isinstance(img, torch.Tensor):
+            if img.dim() == 4:
+                return [_resize_to_pil(f) for f in img]
+            frame_uint8 = (img.permute(1, 2, 0) * 255).round().clamp(0, 255).to(torch.uint8)
+            pil = Image.fromarray(frame_uint8.cpu().numpy()).resize((256, 256))
+            return pil
+        return img
+
+    return _resize_to_pil
+
+
 def _make_single_dataset(
     data_path: str,
     policy_config: PreTrainedConfig,
@@ -387,6 +406,7 @@ def make_dataset(config: TrainConfig, policy_config: PreTrainedConfig, seed: int
                 f"Unknown data_mix: {data_mix}. Available: {list(DATASET_MIXTURES.keys())}"
             )
 
+        image_transforms = _make_image_transforms()
         mixture_spec = DATASET_MIXTURES[data_mix]
         data_mixture = []
         for dataset_name, weight in mixture_spec:
@@ -397,7 +417,7 @@ def make_dataset(config: TrainConfig, policy_config: PreTrainedConfig, seed: int
                 future_offset,
                 config.data.tolerance_s,
                 video_backend=video_backend,
-                image_transforms=None,
+                image_transforms=image_transforms,
             )
             data_mixture.append((ds, weight))
 
@@ -415,7 +435,7 @@ def make_dataset(config: TrainConfig, policy_config: PreTrainedConfig, seed: int
             future_offset,
             config.data.tolerance_s,
             video_backend=video_backend,
-            image_transforms=None,
+            image_transforms=_make_image_transforms(),
         )
 
     return dataset
