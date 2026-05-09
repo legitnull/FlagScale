@@ -247,11 +247,19 @@ def qwen_collate_fn(
         "has_half_event",
         "event_mode",
     }
+    optional_none_keys = event_payload_keys | {
+        "task_index",
+        "subtask_index",
+        "atomic_index",
+    }
 
     original_size = len(batch_list)
     cleaned: list[dict] = []
     for idx, sample in enumerate(batch_list):
-        none_keys = [k for k, v in sample.items() if v is None]
+        none_keys = [
+            k for k, v in sample.items()
+            if v is None and k not in optional_none_keys
+        ]
         if none_keys:
             ep = _scalarize(sample.get("episode_index"))
             fr = _scalarize(sample.get("frame_index"))
