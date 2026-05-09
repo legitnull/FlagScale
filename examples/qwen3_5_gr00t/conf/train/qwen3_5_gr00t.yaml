@@ -12,7 +12,7 @@ system:
     output_directory: ${experiment.exp_dir}
     save_checkpoint: true
     save_freq: 10000
-
+    # resume_from: ./outputs/qwen3_5_gr00t_train/checkpoints/000100
 model:
   model_name: qwen3_5_gr00t
   vlm:

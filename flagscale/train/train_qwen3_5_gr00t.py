@@ -192,12 +192,38 @@ class LeRobotDatasetWithFutureFrames(LeRobotDataset):
         return item
 
 
+class SkipBatch(RuntimeError):
+    """Raised by qwen_collate_fn when every sample in a batch is corrupted
+    (has ``None`` fields). The training loop catches this and fetches the
+    next batch instead of crashing the whole job."""
+
+
+def _scalarize(v):
+    """Best-effort convert a 0-d/1-elem tensor to a Python scalar, else return as-is."""
+    if isinstance(v, torch.Tensor):
+        try:
+            return v.item()
+        except Exception:
+            return v.tolist()
+    return v
+
+
+def _resize_pil_images(images, target_size=(256, 256)):
+    """Recursively resize PIL images, matching starVLA's resize_images pattern."""
+    if isinstance(images, Image.Image):
+        return images.resize(target_size)
+    if isinstance(images, list):
+        return [_resize_pil_images(img, target_size=target_size) for img in images]
+    raise ValueError(f"Unsupported image type or structure: {type(images)}")
+
+
 def qwen_collate_fn(
     batch_list: list[dict],
     *,
     processor,
     prompt_template: str,
     image_feature_keys: list[str],
+    image_size: tuple[int, int] | None = (256, 256),
 ) -> dict:
     """Collate samples into a batch with tokenized Qwen processor inputs.
 
@@ -210,6 +236,31 @@ def qwen_collate_fn(
     """
     future_keys = [f"{k}_future" for k in image_feature_keys]
     all_image_keys = set(image_feature_keys) | set(future_keys)
+
+    # Pre-flight: drop samples that have any None field. default_collate
+    # would otherwise raise `TypeError: ... found <class 'NoneType'>` and
+    # take down the whole distributed job after a 10-min NCCL timeout.
+    original_size = len(batch_list)
+    cleaned: list[dict] = []
+    for idx, sample in enumerate(batch_list):
+        none_keys = [k for k, v in sample.items() if v is None]
+        if none_keys:
+            ep = _scalarize(sample.get("episode_index"))
+            fr = _scalarize(sample.get("frame_index"))
+            ds_idx = _scalarize(sample.get("dataset_index"))
+            print(
+                f"[qwen_collate_fn] DROP bad sample batch_idx={idx} "
+                f"dataset_index={ds_idx} episode_index={ep} frame_index={fr} "
+                f"none_keys={none_keys}",
+                flush=True,
+            )
+            continue
+        cleaned.append(sample)
+    if not cleaned:
+        raise SkipBatch(
+            f"all {original_size} samples in this batch had None fields; skipping"
+        )
+    batch_list = cleaned
 
     # Separate PIL images from tensor-compatible fields
     image_data: dict[str, list[Image.Image]] = {}
@@ -246,6 +297,9 @@ def qwen_collate_fn(
                 for sample_imgs, img in zip(batch_images, imgs):
                     sample_imgs.append(img)
 
+        if image_size is not None:
+            batch_images = _resize_pil_images(batch_images, target_size=image_size)
+
         messages = []
         for imgs, instruction in zip(batch_images, instructions):
             content = [{"type": "image", "image": img} for img in imgs]
@@ -261,8 +315,13 @@ def qwen_collate_fn(
         # min/max_pixels config for resizing, which differs from process_vision_info's
         # qwen_vl_utils defaults (e.g. 256x256 → 252x252 vs different size). Sticking
         # with the 3-step API for now.
+        # enable_thinking=False appends `<think>\n\n</think>\n\n` after the assistant
+        # header so the VLM hidden_states match the no-thinking inference distribution
+        # (aligns with starVLA's lerobot collate).
         texts = [
-            processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True)
+            processor.apply_chat_template(
+                m, tokenize=False, add_generation_prompt=True, enable_thinking=False
+            )
             for m in messages
         ]
         image_inputs, video_inputs = process_vision_info(messages)
@@ -425,6 +484,7 @@ def make_dataset(config: TrainConfig, policy_config: PreTrainedConfig, seed: int
     future_offset = getattr(config.data, "future_offset", None)
     data_mix = getattr(config.data, "data_mix", None)
     video_backend = _resolve_video_backend()
+    image_transforms = None
 
     if data_mix is not None:
         data_root_dir = getattr(config.data, "data_root_dir", None)
@@ -1007,6 +1067,34 @@ def main(config: TrainConfig, seed: int):
             return {k: _to_device(val, dev) for k, val in v.items()}
         return v
 
+    def _next_vla_batch():
+        """Fetch the next VLA batch, skipping batches that qwen_collate_fn
+        has flagged as fully corrupted (all-None). Returns the new dl_iter
+        too, since StopIteration bumps the epoch and rebuilds it.
+        """
+        nonlocal dl_iter, epoch
+        max_skip_in_a_row = 64
+        skipped = 0
+        while True:
+            try:
+                return next(dl_iter)
+            except StopIteration:
+                epoch += 1
+                if sampler is not None:
+                    sampler.set_epoch(epoch)
+                if isinstance(dataset, LeRobotMixtureDataset):
+                    dataset.set_epoch(epoch)
+                dl_iter = iter(dataloader)
+                continue
+            except SkipBatch as e:
+                skipped += 1
+                logger.warning(f"[train] skipping bad batch ({skipped}): {e}")
+                if skipped >= max_skip_in_a_row:
+                    raise RuntimeError(
+                        f"giving up after {skipped} consecutive bad batches"
+                    ) from e
+                continue
+
     # --- Torch profiler ---
     # Produces per-rank Chrome trace JSON at <output_dir>/profiler_traces/rank_<N>/
     profiler_enabled = False
@@ -1051,16 +1139,7 @@ def main(config: TrainConfig, seed: int):
         # --- Dataloader phase ---
         with torch.profiler.record_function("dataloader_vla"):
             start_time = time.perf_counter()
-            try:
-                batch = next(dl_iter)
-            except StopIteration:
-                epoch += 1
-                if sampler is not None:
-                    sampler.set_epoch(epoch)
-                if isinstance(dataset, LeRobotMixtureDataset):
-                    dataset.set_epoch(epoch)
-                dl_iter = iter(dataloader)
-                batch = next(dl_iter)
+            batch = _next_vla_batch()
             if isinstance(batch, dict):
                 batch = {k: _to_device(v, device) for k, v in batch.items()}
 

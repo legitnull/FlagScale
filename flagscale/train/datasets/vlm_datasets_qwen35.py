@@ -84,13 +84,24 @@ def preprocess_qwen_2_visual(
     visual_type: str = "image",
 ) -> dict:
     roles = {"human": "user", "gpt": "assistant"}
-    system_message = "You are a helpful assistant."
     if visual_type not in ["image", "video"]:
         raise ValueError("visual_type must be either 'image' or 'video'")
 
     tokenizer = copy.deepcopy(tokenizer)
-    chat_template = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
+    # Inject `<think>\n\n</think>\n\n` after the assistant header so the supervised
+    # prefix matches the VLA prompt produced with enable_thinking=False. Aligns with
+    # starVLA/dataloader/vlm_datasets_qwen35.py.
+    chat_template = "{% for message in messages %}{% if message['role'] == 'assistant' %}{{'<|im_start|>assistant\n<think>\n\n</think>\n\n' + message['content'] + '<|im_end|>\n'}}{% else %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>\n'}}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
     tokenizer.chat_template = chat_template
+
+    # Length of `<|im_start|>assistant\n<think>\n\n</think>\n\n` in tokens.
+    # Computed once via the actual tokenizer to avoid hard-coding 7.
+    assistant_prefix_len = len(
+        tokenizer.encode(
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+            add_special_tokens=False,
+        )
+    )
 
     visual_replicate_index = 0
     input_ids, targets = [], []
@@ -102,21 +113,8 @@ def preprocess_qwen_2_visual(
         except:
             print(sources)
 
+        # No system message — match starVLA, which doesn't prepend one.
         input_id, target = [], []
-        sys_out = tokenizer.apply_chat_template([{"role": "system", "content": system_message}])
-
-        if isinstance(sys_out, dict) or hasattr(sys_out, "keys"):
-            sys_id = sys_out.get("input_ids", [])
-        else:
-            sys_id = sys_out
-
-        if hasattr(sys_id, "tolist"):
-            sys_id = sys_id.tolist()
-        if len(sys_id) > 0 and isinstance(sys_id[0], list):
-            sys_id = sys_id[0]
-
-        input_id += sys_id
-        target += [IGNORE_INDEX] * len(sys_id)
 
         for conv in source:
             try:
@@ -173,8 +171,10 @@ def preprocess_qwen_2_visual(
             if role in ["user", "system"]:
                 target += [IGNORE_INDEX] * len(encode_id)
             else:
+                # Mask `<|im_start|>assistant\n<think>\n\n</think>\n\n` so loss only
+                # supervises the actual assistant content (matches starVLA's mask=7).
                 target_mask = encode_id.copy()
-                target_mask[:3] = [IGNORE_INDEX] * 3
+                target_mask[:assistant_prefix_len] = [IGNORE_INDEX] * assistant_prefix_len
                 target += target_mask
 
         assert len(input_id) == len(target), f"{len(input_id)} != {len(target)}"
