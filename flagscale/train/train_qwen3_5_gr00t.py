@@ -46,6 +46,7 @@ from flagscale.train.datasets.lerobot_dataset import (
     LeRobotDatasetMetadata,
 )
 from flagscale.train.datasets.lerobot_mixture_dataset import LeRobotMixtureDataset
+from flagscale.train.datasets.lerobot_multiimage_event_dataset import LeRobotMultiImageEventDataset
 from flagscale.train.datasets.utils import (
     dataset_to_policy_features,
     get_hf_features_from_features,
@@ -224,22 +225,29 @@ def qwen_collate_fn(
     prompt_template: str,
     image_feature_keys: list[str],
     image_size: tuple[int, int] | None = (256, 256),
+    fixed_layout_config: dict | None = None,
+    prev_event_prompt: str | None = None,
+    next_event_prompt: str | None = None,
+    half_event_prompt: str | None = None,
 ) -> dict:
     """Collate samples into a batch with tokenized Qwen processor inputs.
 
-    PIL images can't go through default_collate, so we pull them out first,
-    collate the rest (action, state, etc.), then build Qwen inputs from the
-    PIL images + task instructions.
-
-    Adds ``qwen_inputs`` and (if future frames exist) ``qwen_future_inputs``
-    to the batch dict.
+    In the default path this emits the existing ``qwen_inputs`` and
+    ``qwen_future_inputs`` fields. When ``fixed_layout_config.enabled`` is true,
+    it instead builds the two-query layout used by the WM event objective:
+    ``image -> short query -> instruction -> long query`` plus fixed token
+    positions and optional event target groups.
     """
     future_keys = [f"{k}_future" for k in image_feature_keys]
     all_image_keys = set(image_feature_keys) | set(future_keys)
+    event_payload_keys = {
+        "long_event_supervisions",
+        "half_event_images",
+        "half_event_direction",
+        "has_half_event",
+        "event_mode",
+    }
 
-    # Pre-flight: drop samples that have any None field. default_collate
-    # would otherwise raise `TypeError: ... found <class 'NoneType'>` and
-    # take down the whole distributed job after a 10-min NCCL timeout.
     original_size = len(batch_list)
     cleaned: list[dict] = []
     for idx, sample in enumerate(batch_list):
@@ -262,14 +270,14 @@ def qwen_collate_fn(
         )
     batch_list = cleaned
 
-    # Separate PIL images from tensor-compatible fields
     image_data: dict[str, list[Image.Image]] = {}
     for key in all_image_keys:
         if key in batch_list[0]:
             image_data[key] = [sample[key] for sample in batch_list]
 
     non_image_batch = [
-        {k: v for k, v in sample.items() if k not in all_image_keys} for sample in batch_list
+        {k: v for k, v in sample.items() if k not in all_image_keys and k not in event_payload_keys}
+        for sample in batch_list
     ]
     batch = torch.utils.data.default_collate(non_image_batch)
     batch.update(image_data)
@@ -280,12 +288,7 @@ def qwen_collate_fn(
     if isinstance(instructions, str):
         instructions = [instructions]
 
-    def _build_inputs(feature_keys: list[str]):
-        """Build Qwen processor inputs from PIL images across camera keys.
-
-        Groups images per sample: [[cam1, cam2, ...], [cam1, cam2, ...], ...]
-        then formats as Qwen chat messages for tokenization.
-        """
+    def _images_for_keys(feature_keys: list[str]) -> list[list[Image.Image]]:
         batch_images: list[list[Image.Image]] | None = None
         for key in feature_keys:
             imgs = batch[key]
@@ -296,74 +299,291 @@ def qwen_collate_fn(
             else:
                 for sample_imgs, img in zip(batch_images, imgs):
                     sample_imgs.append(img)
-
+        if batch_images is None:
+            raise ValueError(f"No images found for feature keys: {feature_keys}")
         if image_size is not None:
             batch_images = _resize_pil_images(batch_images, target_size=image_size)
+        return batch_images
 
+    def _render_prompt(instruction, prompt=None, replacements=None):
+        if prompt:
+            out = prompt.replace("{instruction}", str(instruction)).replace("{inst}", str(instruction))
+            if replacements:
+                for key, value in replacements.items():
+                    out = out.replace("{" + key + "}", str(value))
+            return out
+        if prompt_template:
+            return prompt_template.replace("{instruction}", str(instruction))
+        return str(instruction)
+
+    def _build_messages(images, texts, prompt=None, replacements_per_sample=None):
+        replacements_iter = replacements_per_sample or [None] * len(images)
         messages = []
-        for imgs, instruction in zip(batch_images, instructions):
+        for imgs, instruction, replacements in zip(images, texts, replacements_iter):
             content = [{"type": "image", "image": img} for img in imgs]
-            prompt = (
-                prompt_template.replace("{instruction}", instruction)
-                if prompt_template
-                else instruction
-            )
-            content.append({"type": "text", "text": prompt})
+            content.append({"type": "text", "text": _render_prompt(instruction, prompt, replacements)})
             messages.append([{"role": "user", "content": content}])
+        return messages
 
-        # NOTE: apply_chat_template(tokenize=True) is simpler but uses the processor's
-        # min/max_pixels config for resizing, which differs from process_vision_info's
-        # qwen_vl_utils defaults (e.g. 256x256 → 252x252 vs different size). Sticking
-        # with the 3-step API for now.
-        # enable_thinking=False appends `<think>\n\n</think>\n\n` after the assistant
-        # header so the VLM hidden_states match the no-thinking inference distribution
-        # (aligns with starVLA's lerobot collate).
-        texts = [
+    def _build_inputs(images, texts, prompt=None, replacements_per_sample=None):
+        messages = _build_messages(images, texts, prompt, replacements_per_sample)
+        rendered = [
             processor.apply_chat_template(
                 m, tokenize=False, add_generation_prompt=True, enable_thinking=False
             )
             for m in messages
         ]
         image_inputs, video_inputs = process_vision_info(messages)
-        result = processor(
-            text=texts, images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt"
+        return processor(
+            text=rendered,
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
         )
 
-        # Debug: log if any sequence exceeds model_max_length
-        if hasattr(processor, 'tokenizer') and hasattr(processor.tokenizer, 'model_max_length'):
-            max_len = processor.tokenizer.model_max_length
-            if 'input_ids' in result:
-                seq_len = result['input_ids'].shape[-1] if result['input_ids'].dim() > 1 else result['input_ids'].shape[0]
-                if seq_len > max_len:
-                    # Log sample info for debugging
-                    ep_idx = batch.get("episode_index", None)
-                    sample_idx = batch.get("index", None)
-                    task_desc = batch.get("task", None)
-                    img_sizes = [
-                        f"{img.size}" for imgs in (batch_images or []) for img in imgs
-                    ]
-                    logger.warning(
-                        f"[VLA_collate] seq_len={seq_len} > max_len={max_len}. "
-                        f"episode_index={ep_idx}, sample_index={sample_idx}, "
-                        f"task={task_desc[:100] if isinstance(task_desc, str) else task_desc}, "
-                        f"image_sizes={img_sizes}, feature_keys={feature_keys}"
-                    )
+    def _extract_fixed_layout_parts(single_inputs):
+        vision_start_token_id = 248053
+        vision_end_token_id = 248054
+        ids = single_inputs["input_ids"][0]
+        attention_mask = single_inputs["attention_mask"][0]
+        mm_token_type_ids = single_inputs.get("mm_token_type_ids", torch.zeros_like(ids))[0]
+        valid = attention_mask.to(torch.bool)
+        ids = ids[valid]
+        mm_token_type_ids = mm_token_type_ids[valid]
+        vision_starts = torch.nonzero(ids == vision_start_token_id, as_tuple=False).flatten()
+        vision_ends = torch.nonzero(ids == vision_end_token_id, as_tuple=False).flatten()
+        if vision_starts.numel() == 0 or vision_ends.numel() == 0:
+            raise ValueError("Fixed layout requires at least one image block in each VLA sample.")
+        image_start = int(vision_starts[0].item())
+        image_end = int(vision_ends[-1].item())
+        return (
+            ids[image_start:image_end + 1],
+            mm_token_type_ids[image_start:image_end + 1],
+            ids[image_end + 1:],
+            mm_token_type_ids[image_end + 1:],
+        )
 
-        return result
+    def _build_fixed_layout_inputs(images, texts, prompt=None, replacements_per_sample=None):
+        cfg = dict(fixed_layout_config or {})
+        if not cfg.get("enabled", False):
+            raise ValueError("fixed_layout_config.enabled must be true for fixed-layout inputs.")
+        num_query_tokens = int(cfg.get("num_query_tokens", 32))
+        instruction_max_tokens = int(cfg.get("instruction_max_tokens", 192))
+        pad_token_id = processor.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = processor.tokenizer.eos_token_id
+        vision_start_token_id = 248053
+        vision_end_token_id = 248054
 
-    batch["qwen_inputs"] = _build_inputs(image_feature_keys)
+        def build_single_inputs(imgs, text, replacements=None):
+            return _build_inputs(
+                [imgs],
+                [text],
+                prompt=prompt,
+                replacements_per_sample=[replacements] if replacements is not None else None,
+            )
+
+        def build_query_wrapped_like_image(image_ids, image_mm):
+            starts = torch.nonzero(image_ids == vision_start_token_id, as_tuple=False).flatten()
+            ends = torch.nonzero(image_ids == vision_end_token_id, as_tuple=False).flatten()
+            if starts.numel() == 0 or starts.numel() != ends.numel():
+                raise ValueError("Cannot mirror query wrappers because image start/end tokens are malformed.")
+            first_start = int(starts[0].item())
+            first_end = int(ends[0].item())
+            per_image_query_tokens = first_end - first_start - 1
+            if per_image_query_tokens <= 0 or num_query_tokens % per_image_query_tokens != 0:
+                raise ValueError(
+                    f"num_query_tokens={num_query_tokens} must be divisible by "
+                    f"per_image_query_tokens={per_image_query_tokens}."
+                )
+            query_image_count = num_query_tokens // per_image_query_tokens
+            start_token = image_ids[first_start:first_start + 1]
+            start_mm = image_mm[first_start:first_start + 1]
+            end_token = image_ids[first_end:first_end + 1]
+            end_mm = image_mm[first_end:first_end + 1]
+            wrapped_ids, wrapped_mm = [], []
+            for image_idx in range(query_image_count):
+                patch_ids = torch.full((per_image_query_tokens,), pad_token_id, dtype=torch.long)
+                patch_mm = torch.zeros((per_image_query_tokens,), dtype=torch.long)
+                wrapped_ids.extend([start_token, patch_ids, end_token])
+                wrapped_mm.extend([start_mm, patch_mm, end_mm])
+            return torch.cat(wrapped_ids), torch.cat(wrapped_mm)
+
+        replacements_iter = replacements_per_sample or [None] * len(images)
+        sample_inputs = []
+        for imgs, text, replacements in zip(images, texts, replacements_iter):
+            single = build_single_inputs(imgs, text, replacements)
+            image_ids, image_mm, instruction_ids, instruction_mm = _extract_fixed_layout_parts(single)
+            if instruction_ids.numel() > instruction_max_tokens:
+                instruction_ids = instruction_ids[-instruction_max_tokens:]
+                instruction_mm = instruction_mm[-instruction_max_tokens:]
+            short_query_ids, short_query_mm = build_query_wrapped_like_image(image_ids, image_mm)
+            long_query_ids, long_query_mm = build_query_wrapped_like_image(image_ids, image_mm)
+            ids = torch.cat([image_ids, short_query_ids, instruction_ids, long_query_ids])
+            mm = torch.cat([image_mm, short_query_mm, instruction_mm, long_query_mm])
+            sample_inputs.append((single, ids, mm, image_ids.numel(), short_query_ids.numel(), instruction_ids.numel()))
+
+        batch_seq_len = max(int(ids.numel()) for _, ids, *_ in sample_inputs)
+        padded_ids, masks, padded_mm = [], [], []
+        image_ends, short_starts, short_ends = [], [], []
+        instruction_starts, instruction_ends, long_starts, long_ends = [], [], [], []
+        all_pixel_values, all_image_grid_thw = [], []
+        for single, ids, mm, image_len, query_len, instruction_len in sample_inputs:
+            left_pad_len = batch_seq_len - ids.numel()
+            left_ids = torch.full((left_pad_len,), pad_token_id, dtype=torch.long)
+            left_mm = torch.zeros((left_pad_len,), dtype=torch.long)
+            padded_ids.append(torch.cat([left_ids, ids]))
+            padded_mm.append(torch.cat([left_mm, mm]))
+            masks.append(torch.cat([torch.zeros((left_pad_len,), dtype=torch.long), torch.ones_like(ids)]))
+            image_end = left_pad_len + image_len - 1
+            short_start = left_pad_len + image_len
+            short_end = short_start + query_len - 1
+            instruction_start = short_end + 1
+            instruction_end = instruction_start + instruction_len - 1
+            long_start = batch_seq_len - query_len
+            long_end = batch_seq_len - 1
+            image_ends.append(image_end)
+            short_starts.append(short_start)
+            short_ends.append(short_end)
+            instruction_starts.append(instruction_start)
+            instruction_ends.append(instruction_end)
+            long_starts.append(long_start)
+            long_ends.append(long_end)
+            if "pixel_values" in single:
+                all_pixel_values.append(single["pixel_values"])
+            if "image_grid_thw" in single:
+                all_image_grid_thw.append(single["image_grid_thw"])
+
+        fixed_positions = {
+            "image_end": torch.tensor(image_ends, dtype=torch.long),
+            "query_start": torch.tensor(short_starts, dtype=torch.long),
+            "query_end": torch.tensor(short_ends, dtype=torch.long),
+            "short_query_start": torch.tensor(short_starts, dtype=torch.long),
+            "short_query_end": torch.tensor(short_ends, dtype=torch.long),
+            "instruction_start": torch.tensor(instruction_starts, dtype=torch.long),
+            "instruction_end": torch.tensor(instruction_ends, dtype=torch.long),
+            "long_query_start": torch.tensor(long_starts, dtype=torch.long),
+            "long_query_end": torch.tensor(long_ends, dtype=torch.long),
+            "query_patch_tokens": num_query_tokens,
+            "query_block_tokens": max(x[4] for x in sample_inputs),
+        }
+        batch_input = {
+            "input_ids": torch.stack(padded_ids),
+            "attention_mask": torch.stack(masks),
+            "mm_token_type_ids": torch.stack(padded_mm),
+        }
+        if all_pixel_values:
+            batch_input["pixel_values"] = torch.cat(all_pixel_values, dim=0)
+        if all_image_grid_thw:
+            batch_input["image_grid_thw"] = torch.cat(all_image_grid_thw, dim=0)
+        return batch_input, fixed_positions
+
+    batch_images = _images_for_keys(image_feature_keys)
+    use_fixed_layout = bool((fixed_layout_config or {}).get("enabled", False))
+    if use_fixed_layout:
+        batch["qwen_inputs"], batch["qwen_fixed_positions"] = _build_fixed_layout_inputs(
+            batch_images, instructions
+        )
+    else:
+        batch["qwen_inputs"] = _build_inputs(batch_images, instructions)
 
     if future_keys and future_keys[0] in batch:
-        batch["qwen_future_inputs"] = _build_inputs(future_keys)
+        batch["qwen_future_inputs"] = _build_inputs(_images_for_keys(future_keys), instructions)
 
-    # Remove raw PIL images — they've been consumed by the processor above.
-    # Leaving them would break downstream steps (e.g. normalize_processor)
-    # that expect tensors.
+    if use_fixed_layout:
+        long_event_supervisions = [sample.get("long_event_supervisions", []) for sample in batch_list]
+        event_modes = []
+        for groups in long_event_supervisions:
+            for group in groups:
+                mode = group.get("mode", "event")
+                if mode not in event_modes:
+                    event_modes.append(mode)
+
+        qwen_long_event_groups = []
+        for mode in event_modes:
+            per_sample_groups = [
+                next((g for g in groups if g.get("mode", "event") == mode), None)
+                for groups in long_event_supervisions
+            ]
+            prev_target_images = [
+                group["prev_images"] if group and group.get("has_prev", False) else batch_images[i]
+                for i, group in enumerate(per_sample_groups)
+            ]
+            next_target_images = [
+                group["next_images"] if group and group.get("has_next", False) else batch_images[i]
+                for i, group in enumerate(per_sample_groups)
+            ]
+            prev_event_langs = [
+                group.get("prev_lang", "") if group and group.get("has_prev", False) else instructions[i]
+                for i, group in enumerate(per_sample_groups)
+            ]
+            next_event_langs = [
+                group.get("next_lang", "") if group and group.get("has_next", False) else instructions[i]
+                for i, group in enumerate(per_sample_groups)
+            ]
+            has_prev = [bool(group and group.get("has_prev", False)) for group in per_sample_groups]
+            has_next = [bool(group and group.get("has_next", False)) for group in per_sample_groups]
+            event_type = mode.replace("_", " ")
+            qwen_prev_inputs, qwen_prev_fixed_positions = _build_fixed_layout_inputs(
+                batch_images,
+                instructions,
+                prompt=prev_event_prompt,
+                replacements_per_sample=[
+                    {"prev_instruction": text, "event_type": event_type, "event_mode": mode}
+                    for text in prev_event_langs
+                ],
+            )
+            qwen_next_inputs, qwen_next_fixed_positions = _build_fixed_layout_inputs(
+                batch_images,
+                instructions,
+                prompt=next_event_prompt,
+                replacements_per_sample=[
+                    {"next_instruction": text, "event_type": event_type, "event_mode": mode}
+                    for text in next_event_langs
+                ],
+            )
+            qwen_long_event_groups.append({
+                "mode": mode,
+                "qwen_prev_inputs": qwen_prev_inputs,
+                "qwen_prev_fixed_positions": qwen_prev_fixed_positions,
+                "qwen_next_inputs": qwen_next_inputs,
+                "qwen_next_fixed_positions": qwen_next_fixed_positions,
+                "qwen_prev_target_inputs": _build_inputs(prev_target_images, instructions),
+                "qwen_next_target_inputs": _build_inputs(next_target_images, instructions),
+                "has_rnd_prev": has_prev,
+                "has_rnd_next": has_next,
+            })
+        batch["qwen_long_event_groups"] = qwen_long_event_groups
+
+        has_half_event = [bool(sample.get("has_half_event", False)) for sample in batch_list]
+        batch["has_half_event"] = has_half_event
+        if any(has_half_event):
+            half_images = [
+                sample.get("half_event_images", []) if has_half_event[i] else batch_images[i]
+                for i, sample in enumerate(batch_list)
+            ]
+            half_directions = [sample.get("half_event_direction", "opposite") for sample in batch_list]
+            half_prompt = half_event_prompt or (
+                "The current task is: {instruction}. Given the current observation, "
+                "predict what the observation should look like in the {half_direction} half of this episode."
+            )
+            batch["qwen_half_event_inputs"], batch["qwen_half_event_fixed_positions"] = _build_fixed_layout_inputs(
+                batch_images,
+                instructions,
+                prompt=half_prompt,
+                replacements_per_sample=[{"half_direction": d or "opposite"} for d in half_directions],
+            )
+            batch["qwen_half_event_target_inputs"] = _build_inputs(half_images, instructions)
+        else:
+            batch["qwen_half_event_inputs"] = None
+            batch["qwen_half_event_fixed_positions"] = None
+            batch["qwen_half_event_target_inputs"] = None
+
     for key in all_image_keys:
         batch.pop(key, None)
 
     return batch
-
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -483,6 +703,8 @@ def _make_single_dataset(
 def make_dataset(config: TrainConfig, policy_config: PreTrainedConfig, seed: int = 42):
     future_offset = getattr(config.data, "future_offset", None)
     data_mix = getattr(config.data, "data_mix", None)
+    dataset_type = getattr(config.data, "dataset_type", "lerobot")
+    use_multiimage_event = dataset_type == "lerobot_multiimage_event"
     video_backend = _resolve_video_backend()
     image_transforms = None
 
@@ -503,14 +725,34 @@ def make_dataset(config: TrainConfig, policy_config: PreTrainedConfig, seed: int
         data_mixture = []
         for dataset_name, weight in mixture_spec:
             data_path = f"{data_root_dir}/{dataset_name}"
-            ds = _make_single_dataset(
-                data_path,
-                policy_config,
-                future_offset,
-                config.data.tolerance_s,
-                video_backend=video_backend,
-                image_transforms=image_transforms,
-            )
+            if use_multiimage_event:
+                ds_meta = LeRobotDatasetMetadata(root=data_path, revision=None)
+                delta_timestamps = _resolve_delta_timestamps(policy_config, ds_meta)
+                if future_offset is not None:
+                    if delta_timestamps is None:
+                        delta_timestamps = {}
+                    for cam_key in ds_meta.camera_keys:
+                        ts_list = list(delta_timestamps.get(cam_key, [0.0]))
+                        ts_list.append(int(future_offset) / ds_meta.fps)
+                        delta_timestamps[cam_key] = ts_list
+                ds = LeRobotMultiImageEventDataset(
+                    root=data_path,
+                    episodes=None,
+                    delta_timestamps=delta_timestamps,
+                    image_transforms=None,
+                    revision=None,
+                    video_backend=video_backend,
+                    tolerance_s=config.data.tolerance_s,
+                )
+            else:
+                ds = _make_single_dataset(
+                    data_path,
+                    policy_config,
+                    future_offset,
+                    config.data.tolerance_s,
+                    video_backend=video_backend,
+                    image_transforms=image_transforms,
+                )
             data_mixture.append((ds, weight))
 
         balance = getattr(config.data, "balance_dataset_weights", True)
@@ -521,14 +763,34 @@ def make_dataset(config: TrainConfig, policy_config: PreTrainedConfig, seed: int
             seed=seed,
         )
     else:
-        dataset = _make_single_dataset(
-            config.data.data_path,
-            policy_config,
-            future_offset,
-            config.data.tolerance_s,
-            video_backend=video_backend,
-            image_transforms=_make_image_transforms(),
-        )
+        if use_multiimage_event:
+            ds_meta = LeRobotDatasetMetadata(root=config.data.data_path, revision=None)
+            delta_timestamps = _resolve_delta_timestamps(policy_config, ds_meta)
+            if future_offset is not None:
+                if delta_timestamps is None:
+                    delta_timestamps = {}
+                for cam_key in ds_meta.camera_keys:
+                    ts_list = list(delta_timestamps.get(cam_key, [0.0]))
+                    ts_list.append(int(future_offset) / ds_meta.fps)
+                    delta_timestamps[cam_key] = ts_list
+            dataset = LeRobotMultiImageEventDataset(
+                root=config.data.data_path,
+                episodes=None,
+                delta_timestamps=delta_timestamps,
+                image_transforms=None,
+                revision=None,
+                video_backend=video_backend,
+                tolerance_s=config.data.tolerance_s,
+            )
+        else:
+            dataset = _make_single_dataset(
+                config.data.data_path,
+                policy_config,
+                future_offset,
+                config.data.tolerance_s,
+                video_backend=video_backend,
+                image_transforms=_make_image_transforms(),
+            )
 
     return dataset
 
@@ -957,6 +1219,10 @@ def main(config: TrainConfig, seed: int):
             processor=policy.vlm.processor,
             prompt_template=policy.vlm._prompt_template,
             image_feature_keys=list(policy.image_features.keys()),
+            fixed_layout_config=getattr(config.data, "fixed_layout", None),
+            prev_event_prompt=getattr(config.data, "prev_event_prompt", None),
+            next_event_prompt=getattr(config.data, "next_event_prompt", None),
+            half_event_prompt=getattr(config.data, "half_event_prompt", None),
         )
 
         dataloader = StatefulDataLoader(

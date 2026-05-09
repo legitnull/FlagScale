@@ -9,6 +9,19 @@ DATASET_MIXTURES: dict[str, list[tuple[str, float]]] = {
     "yupu_test": [
         ("0_30_s_academic_v0_1", 1.0),
     ],
+    "ego1_multiimage": [
+        ("agibot_world", 1.0),
+        ("EgoExoLearn", 1.0),
+        ("GenEgoData", 1.0),
+        ("something_something_v2", 1.0),
+        ("hoi4d", 1.0),
+        ("em_interaction", 1.0),
+        ("ego4d", 1.0),
+        ("epic_kitchens", 1.0),
+        ("egocentric10k", 1.0),
+        ("egodex", 1.0),
+        ("kinetics", 1.0),
+    ],
     "ego1": [
         ("EgoExoLearn_1fps", 1.0),
         ("GenEgoData", 1.0),

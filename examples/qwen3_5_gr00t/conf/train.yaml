@@ -3,7 +3,7 @@ defaults:
   - train: qwen3_5_gr00t
 
 experiment:
-  exp_name: Fs_wm_A2
+  exp_name: Fs_wm_test
   seed: 42
   save_steps: 10000
   load: null
@@ -17,7 +17,7 @@ experiment:
     per_node_task: false
     no_shared_fs: false
     rdzv_backend: static
-    hostfile: /share/project/mycao/wm_exp/hostfile.16
+    hostfile: /share/project/mycao/wm_exp/hostfile.2
   cmds:
     before_start: >-
       pkill -f torchrun || true ;

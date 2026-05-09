@@ -28,6 +28,13 @@ class NFPConfig:
     vlm_feature_layer: int = -1
     nfp_loss_mse_weight: float = 0.1
     nfp_loss_cosine_weight: float = 1.0
+    short_future_loss_weight: float = 1.0
+    prev_event_loss_weight: float = 1.0
+    next_event_loss_weight: float = 1.0
+    half_event_loss_weight: float = 1.0
+    num_query_tokens: int = 32
+    learnable_query_tokens: bool = True
+    allow_unsupervised_query_grad: bool = False
     # Image token ID used to locate image positions in VLM hidden states.
     # Qwen3-VL uses 151655; Qwen3.5-VL uses 248056.
     image_token_id: int = 248056
@@ -105,7 +112,14 @@ class Qwen35Gr00tConfig(PreTrainedConfig):
                 vlm_feature_layer=raw_nfp.get("vlm_feature_layer", -1),
                 nfp_loss_mse_weight=raw_nfp.get("nfp_loss_mse_weight", 0.1),
                 nfp_loss_cosine_weight=raw_nfp.get("nfp_loss_cosine_weight", 1.0),
-                image_token_id=raw_nfp.get("image_token_id", 151655),
+                short_future_loss_weight=raw_nfp.get("short_future_loss_weight", 1.0),
+                prev_event_loss_weight=raw_nfp.get("prev_event_loss_weight", 1.0),
+                next_event_loss_weight=raw_nfp.get("next_event_loss_weight", 1.0),
+                half_event_loss_weight=raw_nfp.get("half_event_loss_weight", 1.0),
+                num_query_tokens=raw_nfp.get("num_query_tokens", 32),
+                learnable_query_tokens=raw_nfp.get("learnable_query_tokens", True),
+                allow_unsupervised_query_grad=raw_nfp.get("allow_unsupervised_query_grad", False),
+                image_token_id=raw_nfp.get("image_token_id", 248056),
             )
 
         use_action_policy_loss = getattr(model_cfg, "use_action_policy_loss", True)

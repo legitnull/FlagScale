@@ -56,6 +56,14 @@ model:
     vlm_feature_layer: -1
     nfp_loss_mse_weight: 0.1
     nfp_loss_cosine_weight: 1.0
+    short_future_loss_weight: 1.0
+    prev_event_loss_weight: 0.5
+    next_event_loss_weight: 0.5
+    half_event_loss_weight: 0.5
+    # Must match data.fixed_layout.num_query_tokens when fixed-layout WM is enabled.
+    num_query_tokens: 256
+    learnable_query_tokens: true
+    allow_unsupervised_query_grad: false
     image_token_id: 248056  # Qwen3.5-VL
 
   # Set to false for Stage 1 (only train NFP + VLM language, no action loss)
@@ -105,6 +113,21 @@ data:
     state_key: eepose
   data_path: ""  # unused when data_mix is set; empty string to satisfy pydantic str type
   tolerance_s: 0.02
+
+  # Enable these together for LeRobot v3.0 multi-image event WM training.
+  # dataset_type: lerobot_multiimage_event
+  # data_mix: ego1_multiimage
+  # data_root_dir: /share/project/hotel/lerobot30_multiimage_data_1fps/event
+  prev_event_prompt: "The previous {event_type} event was: {prev_instruction}. Given the current observation, predict the image latent distribution of that previous event."
+  next_event_prompt: "The next {event_type} event will be: {next_instruction}. Given the current observation, predict the image latent distribution of that next event."
+  half_event_prompt: "The current task is: {instruction}. Given the current observation, predict what the observation should look like in the {half_direction} half of this episode."
+  fixed_layout:
+    enabled: false
+    num_query_tokens: 256
+    learnable_query_tokens: true
+    allow_unsupervised_query_grad: false
+    image_block_max_tokens: 264
+    instruction_max_tokens: 192
 
   # Multi-dataset mixture (set data_mix to use, or leave null for single dataset via data_path)
   data_mix: ego1
