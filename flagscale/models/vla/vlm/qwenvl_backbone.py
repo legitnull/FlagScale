@@ -230,7 +230,8 @@ class QwenVLBackbone(nn.Module):
         return {"hidden_states": outputs.hidden_states}
 
     def fsdp_units(self) -> list[nn.Module]:
-        return list(self.model.model.visual.blocks) + list(self.model.model.language_model.layers)
+        # return list(self.model.model.visual.blocks) + list(self.model.model.language_model.layers)
+        return list(self.model.model.language_model.layers)
 
 
 @register_vlm("qwen2.5-vl")

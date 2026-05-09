@@ -466,9 +466,17 @@ class LazySupervisedDataset(Dataset):
             src = self.list_data_dict[i]
             file_info = src.get("video", src.get("image", "unknown"))
             data_path = src.get("data_path", "")
+            conversations = src.get("conversations", [])
+            # Extract text content from conversations for debugging
+            text_content = ""
+            if conversations:
+                for conv in conversations:
+                    if isinstance(conv, dict) and "value" in conv:
+                        text_content += conv["value"][:200]  # First 200 chars
             print(
-                f"Sample too long (len={data_dict['input_ids'].shape[0]}, max_len={max_len}); "
-                f"clip sample {i}, file: {data_path}/{file_info}"
+                f"[VLM_dataset] Sample too long (len={data_dict['input_ids'].shape[0]}, max_len={max_len}); "
+                f"sample_idx={i}, data_path={data_path}, file={file_info}, "
+                f"text_preview={text_content[:100]}"
             )
             data_dict["input_ids"] = data_dict["input_ids"][:max_len]
             data_dict["labels"] = data_dict["labels"][:max_len]

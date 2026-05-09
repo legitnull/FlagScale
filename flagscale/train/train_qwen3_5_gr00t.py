@@ -266,9 +266,31 @@ def qwen_collate_fn(
             for m in messages
         ]
         image_inputs, video_inputs = process_vision_info(messages)
-        return processor(
+        result = processor(
             text=texts, images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt"
         )
+
+        # Debug: log if any sequence exceeds model_max_length
+        if hasattr(processor, 'tokenizer') and hasattr(processor.tokenizer, 'model_max_length'):
+            max_len = processor.tokenizer.model_max_length
+            if 'input_ids' in result:
+                seq_len = result['input_ids'].shape[-1] if result['input_ids'].dim() > 1 else result['input_ids'].shape[0]
+                if seq_len > max_len:
+                    # Log sample info for debugging
+                    ep_idx = batch.get("episode_index", None)
+                    sample_idx = batch.get("index", None)
+                    task_desc = batch.get("task", None)
+                    img_sizes = [
+                        f"{img.size}" for imgs in (batch_images or []) for img in imgs
+                    ]
+                    logger.warning(
+                        f"[VLA_collate] seq_len={seq_len} > max_len={max_len}. "
+                        f"episode_index={ep_idx}, sample_index={sample_idx}, "
+                        f"task={task_desc[:100] if isinstance(task_desc, str) else task_desc}, "
+                        f"image_sizes={img_sizes}, feature_keys={feature_keys}"
+                    )
+
+        return result
 
     batch["qwen_inputs"] = _build_inputs(image_feature_keys)
 
@@ -305,7 +327,6 @@ def apply_fsdp2(policy, device_mesh):
     # Cast everything to fp32 first so the root param group has uniform dtype.
     policy = policy.float()
 
-    # `reduce_dtype=torch.float32` would make evaluation on libero_goal drop to 94.8% (from 97.0%)
     mp_policy = MixedPrecisionPolicy(
         param_dtype=torch.bfloat16,
         reduce_dtype=torch.bfloat16,
@@ -319,6 +340,17 @@ def apply_fsdp2(policy, device_mesh):
         fully_shard(unit, **fsdp_config, reshard_after_forward=reshard)
 
     fully_shard(policy, **fsdp_config)
+
+    # Enable forward/backward prefetch to overlap all-gather with compute
+    lang_layers = list(policy.vlm.model.model.language_model.layers)
+    for i in range(len(lang_layers) - 1):
+        lang_layers[i].set_modules_to_forward_prefetch([lang_layers[i + 1]])
+        lang_layers[i].set_modules_to_backward_prefetch([lang_layers[i + 1]])
+
+    # vis_blocks = list(policy.vlm.model.model.visual.blocks)
+    # for i in range(len(vis_blocks) - 1):
+    #     vis_blocks[i].set_modules_to_forward_prefetch([vis_blocks[i + 1]])
+    #     vis_blocks[i].set_modules_to_backward_prefetch([vis_blocks[i + 1]])
 
 
 def _resolve_video_backend():
@@ -699,7 +731,8 @@ def update_policy(
     """
     start_time = time.perf_counter()
 
-    optimizer.zero_grad()
+    with torch.profiler.record_function("optimizer_zero_grad"):
+        optimizer.zero_grad()
 
     autocast_context = (
         torch.amp.autocast(get_platform().amp_device_type(), dtype=torch.bfloat16)
@@ -707,32 +740,37 @@ def update_policy(
         else nullcontext()
     )
 
-    with autocast_context:
-        output = policy(batch)
-        vla_loss = output["loss"]
+    with torch.profiler.record_function("forward_vla"):
+        with autocast_context:
+            output = policy(batch)
+            vla_loss = output["loss"]
+
+    with torch.profiler.record_function("backward_vla"):
+        if vlm_batch is not None:
+            policy.set_is_last_backward(False)
+        vla_loss.backward()
 
     if vlm_batch is not None:
-        policy.set_is_last_backward(False)
-    vla_loss.backward()
-
-    if vlm_batch is not None:
-        policy.set_is_last_backward(True)
-        vlm_output = policy(vlm_batch, mode="vlm")
-        vlm_loss_scaled = vlm_loss_scale * vlm_output["vlm_loss"]
-        vlm_loss_scaled.backward()
+        with torch.profiler.record_function("forward_vlm"):
+            policy.set_is_last_backward(True)
+            vlm_output = policy(vlm_batch, mode="vlm")
+            vlm_loss_scaled = vlm_loss_scale * vlm_output["vlm_loss"]
+        with torch.profiler.record_function("backward_vlm"):
+            vlm_loss_scaled.backward()
         output["vlm_loss"] = vlm_output["vlm_loss"]
 
-    # Clip gradients (torch.nn.utils.clip_grad_norm_ works with DTensors in PyTorch ≥2.6)
-    grad_norm = torch.nn.utils.clip_grad_norm_(
-        policy.parameters(), grad_clip_norm if grad_clip_norm > 0 else float("inf")
-    )
+    with torch.profiler.record_function("grad_clip"):
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            policy.parameters(), grad_clip_norm if grad_clip_norm > 0 else float("inf")
+        )
 
-    with lock if lock is not None else nullcontext():
-        optimizer.step()
+    with torch.profiler.record_function("optimizer_step"):
+        with lock if lock is not None else nullcontext():
+            optimizer.step()
 
-    # Step through pytorch scheduler at every batch instead of epoch
-    if lr_scheduler is not None:
-        lr_scheduler.step()
+    with torch.profiler.record_function("lr_scheduler_step"):
+        if lr_scheduler is not None:
+            lr_scheduler.step()
 
     # Update internal buffers if policy has update method
     if has_method(policy, "update"):
@@ -969,55 +1007,150 @@ def main(config: TrainConfig, seed: int):
             return {k: _to_device(val, dev) for k, val in v.items()}
         return v
 
-    for _ in range(step, config.system.train_steps):
-        start_time = time.perf_counter()
-        try:
-            batch = next(dl_iter)
-        except StopIteration:
-            epoch += 1
-            if sampler is not None:
-                sampler.set_epoch(epoch)
-            if isinstance(dataset, LeRobotMixtureDataset):
-                dataset.set_epoch(epoch)
-            dl_iter = iter(dataloader)
-            batch = next(dl_iter)
-        if isinstance(batch, dict):
-            batch = {k: _to_device(v, device) for k, v in batch.items()}
+    # --- Torch profiler ---
+    # Produces per-rank Chrome trace JSON at <output_dir>/profiler_traces/rank_<N>/
+    profiler_enabled = False
+    profiler = None
+    profiler_stop_step = 12  # wait(5) + warmup(2) + active(5)
 
-        if vlm_dl_iter is not None:
-            try:
-                vlm_batch = next(vlm_dl_iter)
-            except StopIteration:
-                if vlm_sampler is not None:
-                    vlm_sampler.set_epoch(epoch)
-                vlm_dl_iter = iter(vlm_dl)
-                vlm_batch = next(vlm_dl_iter)
-        else:
-            vlm_batch = None
-        if vlm_batch is not None:
-            vlm_batch = {
-                k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
-                for k, v in vlm_batch.items()
-            }
-
-        if preprocessor is not None:
-            batch = preprocessor(batch)
-        train_tracker.dataloading_s = time.perf_counter() - start_time
-
-        train_tracker = update_policy(
-            train_tracker,
-            policy,
-            batch,
-            optimizer,
-            use_amp=config.system.use_amp,
-            grad_clip_norm=config.system.grad_clip_norm,
-            lr_scheduler=lr_scheduler,
-            vlm_batch=vlm_batch,
-            vlm_loss_scale=getattr(config.system, "vlm_loss_scale", 0.1),
+    if profiler_enabled:
+        profiler_output_dir = (
+            Path(config.system.checkpoint.output_directory)
+            / "profiler_traces"
+            / f"rank_{rank}"
         )
+        profiler_output_dir.mkdir(parents=True, exist_ok=True)
+
+        def _chrome_trace_handler(prof):
+            trace_file = profiler_output_dir / f"trace_rank{rank}_step{step}.json"
+            prof.export_chrome_trace(str(trace_file))
+            logger.info(f"[Profiler] Rank {rank}: trace saved to {trace_file}")
+
+        profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(
+                wait=5,
+                warmup=2,
+                active=5,
+                repeat=1,
+            ),
+            on_trace_ready=_chrome_trace_handler,
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        )
+        profiler.start()
+        logger.info(
+            f"[Profiler] Rank {rank}: enabled. Traces -> {profiler_output_dir}"
+        )
+
+    for _ in range(step, config.system.train_steps):
+        # --- Dataloader phase ---
+        with torch.profiler.record_function("dataloader_vla"):
+            start_time = time.perf_counter()
+            try:
+                batch = next(dl_iter)
+            except StopIteration:
+                epoch += 1
+                if sampler is not None:
+                    sampler.set_epoch(epoch)
+                if isinstance(dataset, LeRobotMixtureDataset):
+                    dataset.set_epoch(epoch)
+                dl_iter = iter(dataloader)
+                batch = next(dl_iter)
+            if isinstance(batch, dict):
+                batch = {k: _to_device(v, device) for k, v in batch.items()}
+
+        with torch.profiler.record_function("dataloader_vlm"):
+            if vlm_dl_iter is not None:
+                try:
+                    vlm_batch = next(vlm_dl_iter)
+                except StopIteration:
+                    if vlm_sampler is not None:
+                        vlm_sampler.set_epoch(epoch)
+                    vlm_dl_iter = iter(vlm_dl)
+                    vlm_batch = next(vlm_dl_iter)
+            else:
+                vlm_batch = None
+            if vlm_batch is not None:
+                vlm_batch = {
+                    k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+                    for k, v in vlm_batch.items()
+                }
+
+        # Pad VLM batch to model_max_length unconditionally for memory profiling.
+        # Remove this block after profiling.
+        # if vlm_batch is not None:
+        #     max_seq = 6000
+        #     cur_seq = vlm_batch["input_ids"].shape[-1]
+        #     if cur_seq < max_seq:
+        #         pad_len = max_seq - cur_seq
+        #         bs = vlm_batch["input_ids"].shape[0]
+        #         dev = vlm_batch["input_ids"].device
+        #         for key in ("input_ids", "labels", "mm_token_type_ids"):
+        #             if key in vlm_batch:
+        #                 pad = torch.zeros(bs, pad_len, dtype=vlm_batch[key].dtype, device=dev)
+        #                 vlm_batch[key] = torch.cat([vlm_batch[key], pad], dim=1)
+        #         if "attention_mask" in vlm_batch:
+        #             pad = torch.zeros(bs, pad_len, dtype=vlm_batch["attention_mask"].dtype, device=dev)
+        #             vlm_batch["attention_mask"] = torch.cat([vlm_batch["attention_mask"], pad], dim=1)
+
+        with torch.profiler.record_function("preprocessor"):
+            if preprocessor is not None:
+                batch = preprocessor(batch)
+            train_tracker.dataloading_s = time.perf_counter() - start_time
+
+        # Debug: log tensor shapes and GPU memory for memory profiling
+        if step % config.system.log_freq == 0:
+            def _log_batch_shapes(name, b):
+                if b is None:
+                    return
+                parts = []
+                for k, v in b.items():
+                    if isinstance(v, torch.Tensor):
+                        parts.append(f"{k}: {list(v.shape)}")
+                    elif isinstance(v, Mapping):
+                        # Log nested Mapping (e.g. qwen_inputs BatchEncoding)
+                        nested = []
+                        for nk, nv in v.items():
+                            if isinstance(nv, torch.Tensor):
+                                nested.append(f"{nk}: {list(nv.shape)}")
+                        if nested:
+                            parts.append(f"{k}: {{{', '.join(nested)}}}")
+                if parts:
+                    logger.info(
+                        f"[{name}] rank={rank} "
+                        + ", ".join(parts)
+                    )
+            _log_batch_shapes("VLA_batch", batch)
+            _log_batch_shapes("VLM_batch", vlm_batch)
+
+        with torch.profiler.record_function("update_policy"):
+            train_tracker = update_policy(
+                train_tracker,
+                policy,
+                batch,
+                optimizer,
+                use_amp=config.system.use_amp,
+                grad_clip_norm=config.system.grad_clip_norm,
+                lr_scheduler=lr_scheduler,
+                vlm_batch=vlm_batch,
+                vlm_loss_scale=getattr(config.system, "vlm_loss_scale", 0.1),
+            )
 
         step += 1
         train_tracker.step()
+
+        # Advance torch profiler schedule
+        if profiler is not None:
+            profiler.step()
+            if step >= profiler_stop_step:
+                profiler.stop()
+                logger.info(f"[Profiler] Rank {rank}: stopped. Traces saved.")
+                profiler = None
 
         if step % config.system.log_freq == 0:
             logger.info(f"step: {step} {format_train_tracker_step(train_tracker)}")
@@ -1092,5 +1225,8 @@ if __name__ == "__main__":
     logger.info("=" * 100)
     logger.info(f"Experiment: {experiment_config}")
     logger.info(f"Train config: {train_config}")
+
+
+    # torch.cuda.memory._set_allocator_settings("expandable_segments:True")
 
     main(train_config, seed)
