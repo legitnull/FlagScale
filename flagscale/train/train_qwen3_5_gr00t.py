@@ -282,8 +282,7 @@ def qwen_collate_fn(
             continue
         sample = dict(sample)
         for key in optional_index_keys:
-            if key in sample:
-                sample[key] = _normalize_optional_index(sample.get(key))
+            sample[key] = _normalize_optional_index(sample.get(key))
         cleaned.append(sample)
     if not cleaned:
         raise SkipBatch(
