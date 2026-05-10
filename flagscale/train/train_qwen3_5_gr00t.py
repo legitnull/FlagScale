@@ -238,6 +238,13 @@ def qwen_collate_fn(
     ``image -> short query -> instruction -> long query`` plus fixed token
     positions and optional event target groups.
     """
+    timing_enabled = os.getenv("FS_WM_DATA_TIMING", "0") == "1"
+    if not hasattr(qwen_collate_fn, "_timing_count"):
+        qwen_collate_fn._timing_count = 0
+    timing_limit = int(os.getenv("FS_WM_COLLATE_TIMING_LIMIT", "8"))
+    timing = timing_enabled and qwen_collate_fn._timing_count < timing_limit
+    t0 = time.perf_counter() if timing else None
+
     future_keys = [f"{k}_future" for k in image_feature_keys]
     all_image_keys = set(image_feature_keys) | set(future_keys)
     event_payload_keys = {
@@ -301,6 +308,7 @@ def qwen_collate_fn(
     ]
     batch = torch.utils.data.default_collate(non_image_batch)
     batch.update(image_data)
+    t_default_collate = time.perf_counter() if timing else None
 
     instructions = batch["task"]
     if isinstance(instructions, torch.Tensor):
@@ -500,6 +508,7 @@ def qwen_collate_fn(
         return batch_input, fixed_positions
 
     batch_images = _images_for_keys(image_feature_keys)
+    t_current_images = time.perf_counter() if timing else None
     use_fixed_layout = bool((fixed_layout_config or {}).get("enabled", False))
     if use_fixed_layout:
         batch["qwen_inputs"], batch["qwen_fixed_positions"] = _build_fixed_layout_inputs(
@@ -507,9 +516,11 @@ def qwen_collate_fn(
         )
     else:
         batch["qwen_inputs"] = _build_inputs(batch_images, instructions)
+    t_qwen_current = time.perf_counter() if timing else None
 
     if future_keys and future_keys[0] in batch:
         batch["qwen_future_inputs"] = _build_inputs(_images_for_keys(future_keys), instructions)
+    t_qwen_future = time.perf_counter() if timing else None
 
     if use_fixed_layout:
         long_event_supervisions = [sample.get("long_event_supervisions", []) for sample in batch_list]
@@ -570,6 +581,7 @@ def qwen_collate_fn(
                 "has_rnd_next": has_next,
             })
         batch["qwen_long_event_groups"] = qwen_long_event_groups
+        t_long_event = time.perf_counter() if timing else None
 
         has_half_event = [bool(sample.get("has_half_event", False)) for sample in batch_list]
         batch["has_half_event"] = has_half_event
@@ -589,10 +601,24 @@ def qwen_collate_fn(
             replacements_per_sample=[{"half_direction": d or "opposite"} for d in half_directions],
         )
         batch["qwen_half_event_target_inputs"] = _build_inputs(half_images, instructions)
+    t_half_event = time.perf_counter() if timing else None
 
     for key in all_image_keys:
         batch.pop(key, None)
 
+    if timing:
+        t_end = time.perf_counter()
+        qwen_collate_fn._timing_count += 1
+        logger.info(
+            "[collate_timing] "
+            f"batch={len(batch_list)} default_collate_s={t_default_collate - t0:.4f} "
+            f"resize_current_s={t_current_images - t_default_collate:.4f} "
+            f"qwen_current_s={t_qwen_current - t_current_images:.4f} "
+            f"qwen_future_s={(t_qwen_future - t_qwen_current) if t_qwen_future else 0.0:.4f} "
+            f"long_event_s={(t_long_event - t_qwen_future) if use_fixed_layout else 0.0:.4f} "
+            f"half_event_s={(t_half_event - t_long_event) if use_fixed_layout else 0.0:.4f} "
+            f"total_s={t_end - t0:.4f}"
+        )
     return batch
 
 def set_seed(seed: int):

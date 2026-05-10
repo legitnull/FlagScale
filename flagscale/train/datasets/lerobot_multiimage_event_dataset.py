@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,9 @@ class LeRobotMultiImageEventDataset(LeRobotDataset):
             mode: self._load_event_lookup(filename, idx_col)
             for mode, (filename, idx_col) in self.EVENT_META.items()
         }
+        self._timing_enabled = os.getenv("FS_WM_DATA_TIMING", "0") == "1"
+        self._timing_limit = int(os.getenv("FS_WM_DATA_TIMING_LIMIT", "4"))
+        self._timing_count = 0
 
     def load_hf_dataset(self) -> hf_datasets.Dataset:
         features = get_hf_features_from_features(self.features)
@@ -307,7 +311,10 @@ class LeRobotMultiImageEventDataset(LeRobotDataset):
         return [images_by_key[k] for k in keys if k in images_by_key]
 
     def __getitem__(self, idx) -> dict:
+        timing = self._timing_enabled and self._timing_count < self._timing_limit
+        t0 = time.perf_counter() if timing else None
         item = super().__getitem__(idx)
+        t_base = time.perf_counter() if timing else None
         ep_idx = int(self._scalar(item["episode_index"]))
         base_abs_idx = int(self._scalar(item.get("index", idx)))
 
@@ -329,9 +336,11 @@ class LeRobotMultiImageEventDataset(LeRobotDataset):
             if isinstance(item.get(future_key), Image.Image):
                 item[future_key] = item[future_key].resize((256, 256))
 
+        t_resize = time.perf_counter() if timing else None
         current_task = str(item.get("task", ""))
         rng = np.random.default_rng(base_abs_idx)
         event_targets = self._get_event_targets(ep_idx, base_abs_idx, current_task, rng)
+        t_event = time.perf_counter() if timing else None
 
         camera_keys = list(self.meta.camera_keys)
         long_event_supervisions = []
@@ -357,4 +366,16 @@ class LeRobotMultiImageEventDataset(LeRobotDataset):
         item["half_event_direction"] = half_event.get("direction", "") if half_event else ""
         item["has_half_event"] = bool(half_event_images)
         item["event_mode"] = "joint" if long_event_supervisions else "half_episode"
+        if timing:
+            t_end = time.perf_counter()
+            self._timing_count += 1
+            logger.info(
+                "[data_timing] "
+                f"dataset={self.root.name} idx={idx} abs_idx={base_abs_idx} "
+                f"base_hf_decode_s={t_base - t0:.4f} "
+                f"current_resize_s={t_resize - t_base:.4f} "
+                f"event_neighbor_sample_s={t_event - t_resize:.4f} "
+                f"event_pack_s={t_end - t_event:.4f} "
+                f"total_s={t_end - t0:.4f} mode={item['event_mode']}"
+            )
         return item
