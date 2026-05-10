@@ -253,6 +253,15 @@ def qwen_collate_fn(
         "atomic_index",
     }
 
+    optional_index_keys = {"task_index", "subtask_index", "atomic_index"}
+
+    def _normalize_optional_index(value):
+        if value is None:
+            return torch.tensor(-1, dtype=torch.long)
+        if isinstance(value, torch.Tensor):
+            return value.to(dtype=torch.long)
+        return torch.as_tensor(value, dtype=torch.long)
+
     original_size = len(batch_list)
     cleaned: list[dict] = []
     for idx, sample in enumerate(batch_list):
@@ -271,6 +280,10 @@ def qwen_collate_fn(
                 flush=True,
             )
             continue
+        sample = dict(sample)
+        for key in optional_index_keys:
+            if key in sample:
+                sample[key] = _normalize_optional_index(sample.get(key))
         cleaned.append(sample)
     if not cleaned:
         raise SkipBatch(
