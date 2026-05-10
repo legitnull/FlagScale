@@ -3,7 +3,7 @@ defaults:
   - train: qwen3_5_gr00t
 
 experiment:
-  exp_name: 0509_wm_zero2_profile_vlm_prefetch_noshard_visual_no_dit_fwd
+  exp_name: 0510_wm_zero3_vlm_prefetch_noshard_visual_no_dit_fwd_ac_full_a800
   seed: 42
   save_steps: 10000
   load: null

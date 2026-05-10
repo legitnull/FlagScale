@@ -13,6 +13,16 @@ system:
     save_checkpoint: true
     save_freq: 10000
 
+  activation_checkpoint:
+    # mode: none
+    mode: full
+    # selective_ac_option: "op"
+    # preserve_rng_state: true
+    # memory_budget: 0.5
+    # checkpoint_patterns:
+    #   - "vlm\\.model\\.model\\.language_model\\.layers\\.\\d+"
+    #   - "action_model\\._head\\.model\\.transformer_blocks\\.\\d+"
+
 model:
   model_name: qwen3_5_gr00t
   vlm:
@@ -46,6 +56,9 @@ model:
       num_layers: 16
       output_dim: 1024
       positional_embeddings: None
+
+  # chunked_ce_tokens: 128
+  chunked_ce_tokens: 0
 
   # NFP (Next Frame Prediction) head
   nfp:

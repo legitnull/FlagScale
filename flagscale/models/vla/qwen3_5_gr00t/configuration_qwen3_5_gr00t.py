@@ -7,7 +7,9 @@ from typing import TYPE_CHECKING, Any
 from flagscale.models.configs.types import NormalizationMode
 from flagscale.models.utils.constants import ACTION
 from flagscale.models.vla.action_model.gr00t_action_header import GR00TActionHeadConfig
-from flagscale.models.vla.action_model.gr00t_action_header_dynamic import GR00TDynamicActionHeadConfig
+from flagscale.models.vla.action_model.gr00t_action_header_dynamic import (
+    GR00TDynamicActionHeadConfig,
+)
 from flagscale.models.vla.pretrained_config import PreTrainedConfig
 from flagscale.models.vla.vlm.qwenvl_backbone import QwenVLConfig
 
@@ -46,6 +48,8 @@ class Qwen35Gr00tConfig(PreTrainedConfig):
     nfp: NFPConfig | None = None
     # When False, action loss is zeroed out (Stage 1: only NFP + VLM language).
     use_action_policy_loss: bool = True
+    # Tokens per chunk for memory-efficient VLM cross-entropy. 0 = use HF default (no chunking).
+    chunked_ce_tokens: int = 128
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -110,6 +114,9 @@ class Qwen35Gr00tConfig(PreTrainedConfig):
 
         use_action_policy_loss = getattr(model_cfg, "use_action_policy_loss", True)
         kwargs["use_action_policy_loss"] = use_action_policy_loss
+
+        chunked_ce = getattr(model_cfg, "chunked_ce_tokens", 128)
+        kwargs["chunked_ce_tokens"] = chunked_ce
 
         raw_norm = getattr(model_cfg, "normalization_mapping", None)
         if raw_norm is not None:

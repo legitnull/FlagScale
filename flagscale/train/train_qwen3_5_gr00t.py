@@ -53,6 +53,10 @@ from flagscale.train.datasets.utils import (
 )
 from flagscale.train.processor import PolicyProcessorPipeline
 from flagscale.train.train_config import TrainConfig
+from flagscale.train.utils.activation_checkpoint import (
+    DEFAULT_OP_SAC_SAVE_LIST,
+    apply_activation_checkpointing,
+)
 from flagscale.train.utils.logging_utils import (
     AverageMeter,
     MetricsTracker,
@@ -271,18 +275,20 @@ def qwen_collate_fn(
         )
 
         # Debug: log if any sequence exceeds model_max_length
-        if hasattr(processor, 'tokenizer') and hasattr(processor.tokenizer, 'model_max_length'):
+        if hasattr(processor, "tokenizer") and hasattr(processor.tokenizer, "model_max_length"):
             max_len = processor.tokenizer.model_max_length
-            if 'input_ids' in result:
-                seq_len = result['input_ids'].shape[-1] if result['input_ids'].dim() > 1 else result['input_ids'].shape[0]
+            if "input_ids" in result:
+                seq_len = (
+                    result["input_ids"].shape[-1]
+                    if result["input_ids"].dim() > 1
+                    else result["input_ids"].shape[0]
+                )
                 if seq_len > max_len:
                     # Log sample info for debugging
                     ep_idx = batch.get("episode_index", None)
                     sample_idx = batch.get("index", None)
                     task_desc = batch.get("task", None)
-                    img_sizes = [
-                        f"{img.size}" for imgs in (batch_images or []) for img in imgs
-                    ]
+                    img_sizes = [f"{img.size}" for imgs in (batch_images or []) for img in imgs]
                     logger.warning(
                         f"[VLA_collate] seq_len={seq_len} > max_len={max_len}. "
                         f"episode_index={ep_idx}, sample_index={sample_idx}, "
@@ -334,7 +340,7 @@ def apply_fsdp2(policy, device_mesh):
     fsdp_config = {"mesh": device_mesh, "mp_policy": mp_policy}
 
     # reshard_after_forward=False keeps params unsharded during forward+backward
-    reshard = False
+    reshard = True
 
     for unit in policy.fsdp_units():
         fully_shard(unit, **fsdp_config, reshard_after_forward=reshard)
@@ -740,10 +746,9 @@ def update_policy(
         else nullcontext()
     )
 
-    with torch.profiler.record_function("forward_vla"):
-        with autocast_context:
-            output = policy(batch)
-            vla_loss = output["loss"]
+    with torch.profiler.record_function("forward_vla"), autocast_context:
+        output = policy(batch)
+        vla_loss = output["loss"]
 
     with torch.profiler.record_function("backward_vla"):
         if vlm_batch is not None:
@@ -946,6 +951,15 @@ def main(config: TrainConfig, seed: int):
             vlm_sampler = vlm_data_module["sampler"]
             vlm_dl_iter = iter(vlm_dl)
 
+    # --- Apply Activation Checkpointing (before FSDP) ---
+    ac_config = config.system.activation_checkpoint
+    apply_activation_checkpointing(
+        policy,
+        ac_config,
+        units=policy.fsdp_units(),
+        op_sac_save_list=DEFAULT_OP_SAC_SAVE_LIST,
+    )
+
     # --- Apply FSDP2 ---
     device_mesh = init_device_mesh(get_platform().name(), (world_size,))
     apply_fsdp2(policy, device_mesh)
@@ -1015,9 +1029,7 @@ def main(config: TrainConfig, seed: int):
 
     if profiler_enabled:
         profiler_output_dir = (
-            Path(config.system.checkpoint.output_directory)
-            / "profiler_traces"
-            / f"rank_{rank}"
+            Path(config.system.checkpoint.output_directory) / "profiler_traces" / f"rank_{rank}"
         )
         profiler_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1043,9 +1055,7 @@ def main(config: TrainConfig, seed: int):
             with_stack=True,
         )
         profiler.start()
-        logger.info(
-            f"[Profiler] Rank {rank}: enabled. Traces -> {profiler_output_dir}"
-        )
+        logger.info(f"[Profiler] Rank {rank}: enabled. Traces -> {profiler_output_dir}")
 
     for _ in range(step, config.system.train_steps):
         # --- Dataloader phase ---
@@ -1105,6 +1115,7 @@ def main(config: TrainConfig, seed: int):
 
         # Debug: log tensor shapes and GPU memory for memory profiling
         if step % config.system.log_freq == 0:
+
             def _log_batch_shapes(name, b):
                 if b is None:
                     return
@@ -1121,10 +1132,8 @@ def main(config: TrainConfig, seed: int):
                         if nested:
                             parts.append(f"{k}: {{{', '.join(nested)}}}")
                 if parts:
-                    logger.info(
-                        f"[{name}] rank={rank} "
-                        + ", ".join(parts)
-                    )
+                    logger.info(f"[{name}] rank={rank} " + ", ".join(parts))
+
             _log_batch_shapes("VLA_batch", batch)
             _log_batch_shapes("VLM_batch", vlm_batch)
 
@@ -1225,7 +1234,6 @@ if __name__ == "__main__":
     logger.info("=" * 100)
     logger.info(f"Experiment: {experiment_config}")
     logger.info(f"Train config: {train_config}")
-
 
     # torch.cuda.memory._set_allocator_settings("expandable_segments:True")
 

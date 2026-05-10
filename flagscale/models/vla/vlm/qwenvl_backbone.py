@@ -362,6 +362,28 @@ class Qwen3_5VLBackbone(QwenVLBackbone):
             )
         return model
 
+    def train(self, mode: bool = True):
+        # Qwen3.5's DynamicCache accumulates KV states via concatenation.
+        # Activation checkpointing recomputes the forward pass, causing double-append
+        # and shape mismatches. Disable the cache entirely during training.
+        super().train(mode)
+        cache_enabled = not mode
+        self.model.config.use_cache = cache_enabled
+        self.model.config.text_config.use_cache = cache_enabled
+        self.model.model.language_model.config.use_cache = cache_enabled
+        return self
+
+    def forward(self, batch: dict[str, torch.Tensor], **kwargs) -> dict[str, torch.Tensor]:
+        with torch.autocast(get_platform().amp_device_type(), dtype=torch.bfloat16):
+            outputs = self.model(
+                **batch,
+                output_hidden_states=True,
+                return_dict=True,
+                use_cache=not self.training,
+                **kwargs,
+            )
+        return {"hidden_states": outputs.hidden_states}
+
     def build_qwenvl_inputs(
         self, images: list[list[Image.Image]], instructions: list[str]
     ) -> dict[str, torch.Tensor]:

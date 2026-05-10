@@ -31,11 +31,15 @@ from flagscale.models.utils.constants import (
     VLM_CONFIG_DIR,
     resolve_pretrained_dir,
 )
-from flagscale.models.vla.action_model.gr00t_action_header_dynamic import GatedMLP, PerLayerHeadGating
+from flagscale.models.vla.action_model.gr00t_action_header_dynamic import (
+    GatedMLP,
+    PerLayerHeadGating,
+)
 from flagscale.models.vla.base_policy import TrainablePolicy
 from flagscale.models.vla.registry import build_action_model, build_vlm
 from flagscale.models.vla.utils import get_vlm_config
 from flagscale.platforms.platform_manager import get_platform
+from flagscale.train.utils.chunked_cross_entropy import chunked_cross_entropy_loss
 
 
 class Qwen35Gr00t(TrainablePolicy):
@@ -74,15 +78,17 @@ class Qwen35Gr00t(TrainablePolicy):
                     dropout=self.nfp_config.dropout,
                 )
             else:
-                self.nfp_head = nn.ModuleList([
-                    GatedMLP(
-                        hidden_dim=self.nfp_config.vl_hidden_dim,
-                        expand_ratio=self.nfp_config.expand_ratio,
-                        depth=self.nfp_config.depth,
-                        dropout=self.nfp_config.dropout,
-                    )
-                    for _ in range(self.nfp_head_num)
-                ])
+                self.nfp_head = nn.ModuleList(
+                    [
+                        GatedMLP(
+                            hidden_dim=self.nfp_config.vl_hidden_dim,
+                            expand_ratio=self.nfp_config.expand_ratio,
+                            depth=self.nfp_config.depth,
+                            dropout=self.nfp_config.dropout,
+                        )
+                        for _ in range(self.nfp_head_num)
+                    ]
+                )
                 action_condition_mode = getattr(self.nfp_config, "action_condition_mode", "concat")
                 if action_condition_mode == "gate":
                     self.nfp_head_gating = PerLayerHeadGating(
@@ -160,8 +166,12 @@ class Qwen35Gr00t(TrainablePolicy):
                     qwen_future_inputs = batch.get("qwen_future_inputs")
                     if qwen_future_inputs is None:
                         future_keys = [f"{k}_future" for k in self.image_features]
-                        future_images, _ = self.vlm.prepare_input(batch, image_feature_keys=future_keys)
-                        qwen_future_inputs = self.vlm.build_qwenvl_inputs(future_images, instructions)
+                        future_images, _ = self.vlm.prepare_input(
+                            batch, image_feature_keys=future_keys
+                        )
+                        qwen_future_inputs = self.vlm.build_qwenvl_inputs(
+                            future_images, instructions
+                        )
 
             image_mask = qwen_inputs["input_ids"] == self.nfp_config.image_token_id
             future_image_embeddings = self.vlm.build_image_embeddings(**qwen_future_inputs)
@@ -194,18 +204,22 @@ class Qwen35Gr00t(TrainablePolicy):
                 nfp_feature_list, nfp_mse_loss, nfp_cosine_loss = [], [], []
                 B = last_hidden.shape[0]
                 T = self.nfp_head_num
-                V = qwen_inputs['image_grid_thw'].shape[0] // B
-                P = qwen_inputs['image_grid_thw'][0].prod().item() // 4
+                V = qwen_inputs["image_grid_thw"].shape[0] // B
+                P = qwen_inputs["image_grid_thw"][0].prod().item() // 4
                 D = last_hidden.shape[-1]
 
                 fut_emb = future_image_embeddings.view(B, V, T, P, D)
 
                 for i, head in enumerate(self.nfp_head):
                     nfp_outputs = head(nfp_input)
-                    mse_loss, cosine_loss = self._nfp_loss(nfp_outputs, fut_emb[:, :, i].reshape(-1, D))
+                    mse_loss, cosine_loss = self._nfp_loss(
+                        nfp_outputs, fut_emb[:, :, i].reshape(-1, D)
+                    )
                     nfp_mse_loss.append(mse_loss)
                     nfp_cosine_loss.append(cosine_loss)
-                    nfp_feature_list.append(nfp_outputs.reshape(B, -1, nfp_outputs.shape[-1]).detach().clone())
+                    nfp_feature_list.append(
+                        nfp_outputs.reshape(B, -1, nfp_outputs.shape[-1]).detach().clone()
+                    )
 
                 action_condition_mode = getattr(self.nfp_config, "action_condition_mode", "concat")
                 if action_condition_mode == "gate":
@@ -217,20 +231,28 @@ class Qwen35Gr00t(TrainablePolicy):
                 nfp_outputs = self.nfp_head(nfp_input)
                 mse_loss, cosine_loss = self._nfp_loss(nfp_outputs, future_image_embeddings)
                 nfp_mse_loss, nfp_cosine_loss = [mse_loss], [cosine_loss]
-                nfp_feature = nfp_outputs.reshape(last_hidden.shape[0], -1, nfp_outputs.shape[-1]).detach().clone()
+                nfp_feature = (
+                    nfp_outputs.reshape(last_hidden.shape[0], -1, nfp_outputs.shape[-1])
+                    .detach()
+                    .clone()
+                )
 
         if self.use_action_policy_loss:
             with torch.autocast(get_platform().amp_device_type(), dtype=torch.float32):
                 if isinstance(actions, list):
                     if isinstance(actions[0], torch.Tensor):
-                        actions = torch.stack(actions).to(device=last_hidden.device, dtype=last_hidden.dtype)
+                        actions = torch.stack(actions).to(
+                            device=last_hidden.device, dtype=last_hidden.dtype
+                        )
                     else:
                         actions = torch.tensor(
-                            np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype,
+                            np.array(actions),
+                            device=last_hidden.device,
+                            dtype=last_hidden.dtype,
                         )
                 else:
                     actions = actions.to(device=last_hidden.device, dtype=last_hidden.dtype)
-                actions_target = actions[:, -(self.future_action_window_size + 1):, :]
+                actions_target = actions[:, -(self.future_action_window_size + 1) :, :]
 
                 repeated_diffusion_steps = self.config.action_model.repeated_diffusion_steps
 
@@ -241,10 +263,14 @@ class Qwen35Gr00t(TrainablePolicy):
                 if state is not None:
                     if isinstance(state, list):
                         if isinstance(state[0], torch.Tensor):
-                            state = torch.stack(state).to(device=last_hidden.device, dtype=last_hidden.dtype)
+                            state = torch.stack(state).to(
+                                device=last_hidden.device, dtype=last_hidden.dtype
+                            )
                         else:
                             state = torch.tensor(
-                                np.array(state), device=last_hidden.device, dtype=last_hidden.dtype,
+                                np.array(state),
+                                device=last_hidden.device,
+                                dtype=last_hidden.dtype,
                             )
                     else:
                         state = state.to(device=last_hidden.device, dtype=last_hidden.dtype)
@@ -290,10 +316,25 @@ class Qwen35Gr00t(TrainablePolicy):
     def forward_vlm(self, vlm_batch: dict[str, torch.Tensor]) -> torch.Tensor:
         """Separate VLM co-train forward, called after VLA backward to reduce peak memory."""
         device = next(self.parameters()).device
-        vlm_batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
-                     for k, v in vlm_batch.items()}
-        with torch.autocast(get_platform().amp_device_type(), dtype=torch.bfloat16):
-            vlm_loss = self.vlm.model(**vlm_batch, return_dict=True).loss
+        vlm_batch = {
+            k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+            for k, v in vlm_batch.items()
+        }
+        chunk_tokens = self.config.chunked_ce_tokens
+        if chunk_tokens > 0:
+            labels = vlm_batch.pop("labels", None)
+            with torch.autocast(get_platform().amp_device_type(), dtype=torch.bfloat16):
+                output = self.vlm.model(**vlm_batch, labels=None, return_dict=True)
+                logits = output.logits
+            # Causal LM shift: logits[i] predicts labels[i+1]
+            shift_logits = logits[:, :-1, :]
+            shift_labels = labels[:, 1:]
+            vlm_loss = chunked_cross_entropy_loss(
+                shift_logits, shift_labels, chunk_tokens=chunk_tokens
+            )
+        else:
+            with torch.autocast(get_platform().amp_device_type(), dtype=torch.bfloat16):
+                vlm_loss = self.vlm.model(**vlm_batch, return_dict=True).loss
         return vlm_loss
 
     @torch.inference_mode()
@@ -349,7 +390,9 @@ class Qwen35Gr00t(TrainablePolicy):
                 nfp_feature = []
                 for i, head in enumerate(self.nfp_head):
                     nfp_outputs = head(nfp_input)
-                    nfp_feature.append(nfp_outputs.reshape(last_hidden.shape[0], -1, nfp_outputs.shape[-1]))
+                    nfp_feature.append(
+                        nfp_outputs.reshape(last_hidden.shape[0], -1, nfp_outputs.shape[-1])
+                    )
                 action_condition_mode = getattr(self.nfp_config, "action_condition_mode", "concat")
                 if action_condition_mode == "gate":
                     nfp_feature = self.nfp_head_gating(nfp_feature)

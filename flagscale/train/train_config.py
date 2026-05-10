@@ -4,7 +4,7 @@ Training configuration models using Pydantic.
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, Field, field_validator
@@ -140,6 +140,16 @@ class CheckpointConfig(BaseModel):
     resume_from: str | None = None
 
 
+class ActivationCheckpointConfig(BaseModel):
+    """Activation checkpointing (recomputation) configuration."""
+
+    mode: Literal["full", "selective", "memory_budget", "none"] = "none"
+    selective_ac_option: str = "2"
+    preserve_rng_state: bool = True
+    memory_budget: float = 0.5
+    checkpoint_patterns: list[str] | None = None
+
+
 class SystemConfig(BaseModel):
     """Training loop configuration"""
 
@@ -154,6 +164,9 @@ class SystemConfig(BaseModel):
     num_workers: int = 4
 
     checkpoint: CheckpointConfig
+    activation_checkpoint: ActivationCheckpointConfig = Field(
+        default_factory=ActivationCheckpointConfig
+    )
     raw: DictConfig | None = Field(default=None, exclude=True)
 
     def __getattr__(self, name):
