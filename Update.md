@@ -71,3 +71,62 @@ Observed results:
 - no `Traceback`, `ERROR`, `Exception`, or `DROP bad sample` was observed in the short test window
 
 The two-node test was stopped after initialization verification to release the 16 GPUs. It did not wait long enough to record the first training step/loss line.
+
+## Distributed Event Training Fixes and Full VLM Test
+
+This round fixes the two-node distributed hang observed after enabling previous, next, and half-event prediction losses. The root cause was that different ranks could execute different event-loss graph paths when a batch had no valid samples for one event branch. That caused mismatched FSDP/NCCL collectives during backward.
+
+### Model Forward Fixes
+
+- Reworked fixed-layout query embedding insertion in `flagscale/models/vla/qwen3_5_gr00t/modeling_qwen3_5_gr00t.py` to avoid in-place writes into embedding views.
+  - `_insert_query_embeddings()` now rebuilds each row with patched query segments and returns a stacked tensor.
+  - `_run_fixed_layout_hidden()` clones token embeddings before replacing image/query regions.
+- Kept event forward execution consistent across ranks when event losses are enabled.
+  - `compute_event_loss()` no longer skips the whole event branch just because the local rank has an all-false sample mask.
+  - `_masked_nfp_loss()` now returns a graph-connected zero when the sample mask is all false:
+    - this preserves the event branch autograd graph and lets FSDP hooks run consistently.
+- Added event-branch gating by loss weight.
+  - Previous, next, and half-event branches are only skipped when their configured loss weight is `0.0`.
+  - This keeps short-only tests cheap while preserving full-event distributed consistency when event weights are enabled.
+
+### Dataset and Collate Fixes
+
+- Updated `qwen_collate_fn()` in `flagscale/train/train_qwen3_5_gr00t.py` so every rank builds the same fixed event mode structure.
+  - Event groups now use the fixed `LeRobotMultiImageEventDataset.EVENT_MODES` list instead of deriving modes from the current local batch.
+- Always builds `qwen_half_event_inputs`, `qwen_half_event_fixed_positions`, and `qwen_half_event_target_inputs` in fixed-layout mode.
+  - Invalid half-event samples use the current batch image as a dummy target.
+  - `has_half_event` remains the loss mask, so invalid samples do not contribute to the half-event loss.
+
+### Distributed Runtime Fixes
+
+- Sets the local CUDA device before `dist.init_process_group()`.
+- Passes `device_ids=[local_rank]` to distributed barriers in the training script.
+- Removed temporary `[WM_TRACE]` debug prints after confirming the hang location.
+
+### Validation
+
+Two-node, 16-rank tests were run through `/share/project/mycao/run_multiimage_event.sh`.
+
+1. Short/event-disabled smoke test:
+   - Used event loss weights set to `0.0`.
+   - Completed one training step successfully.
+
+2. Full-event frozen-VLM/action test:
+   - Used default previous, next, and half-event loss weights.
+   - Completed one training step successfully.
+   - Confirmed the earlier all-reduce/all-gather hang was fixed.
+
+3. Full-event VLM-open test with visual encoder and action model frozen:
+   - Override used:
+     - `action_model\..*`
+     - `vlm\.model\.model\.visual\..*`
+   - Parameter summary confirmed:
+     - `action_model: 0 trainable, 161,472,775 frozen`
+     - `vlm: 4,205,751,296 trainable, 333,514,240 frozen`
+   - Completed one full training step on 16 ranks:
+     - `smpl:16`
+     - `nfp_mse` around `0.35-0.36`
+     - `nfp_cos` around `0.97-0.98`
+     - `grdn:8.521`
+     - `updt_s` around `26.6-29.1s`
+   - Training ended with `Training completed`, and both nodes released all GPU memory afterward.

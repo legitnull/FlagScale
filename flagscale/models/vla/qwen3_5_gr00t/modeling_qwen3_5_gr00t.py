@@ -221,26 +221,36 @@ class Qwen35Gr00t(TrainablePolicy):
             device=inputs_embeds.device,
         )
 
+        patched_rows = []
         for batch_idx in range(batch_size):
-            short_slice = inputs_embeds[batch_idx, short_starts[batch_idx]:short_ends[batch_idx] + 1, :]
-            long_slice = inputs_embeds[batch_idx, long_starts[batch_idx]:long_ends[batch_idx] + 1, :]
-            short_ids = input_ids[batch_idx, short_starts[batch_idx]:short_ends[batch_idx] + 1]
-            long_ids = input_ids[batch_idx, long_starts[batch_idx]:long_ends[batch_idx] + 1]
-            short_patch_mask = (short_ids != VISION_START_TOKEN_ID) & (short_ids != VISION_END_TOKEN_ID)
-            long_patch_mask = (long_ids != VISION_START_TOKEN_ID) & (long_ids != VISION_END_TOKEN_ID)
-            if short_patch_mask.sum().item() != self.num_input_query_tokens:
-                raise ValueError(
-                    f"Sample {batch_idx} short query patch-token count does not match "
-                    f"num_query_tokens={self.num_input_query_tokens}."
-                )
-            if long_patch_mask.sum().item() != self.num_input_query_tokens:
-                raise ValueError(
-                    f"Sample {batch_idx} long query patch-token count does not match "
-                    f"num_query_tokens={self.num_input_query_tokens}."
-                )
-            short_slice[short_patch_mask] = short_embeds
-            long_slice[long_patch_mask] = long_embeds
-        return inputs_embeds
+            row_embeds = inputs_embeds[batch_idx]
+            replacements = []
+            for name, start, end, query_embeds in (
+                ("short", short_starts[batch_idx], short_ends[batch_idx] + 1, short_embeds),
+                ("long", long_starts[batch_idx], long_ends[batch_idx] + 1, long_embeds),
+            ):
+                query_ids = input_ids[batch_idx, start:end]
+                patch_mask = (query_ids != VISION_START_TOKEN_ID) & (query_ids != VISION_END_TOKEN_ID)
+                if patch_mask.sum().item() != self.num_input_query_tokens:
+                    raise ValueError(
+                        f"Sample {batch_idx} {name} query patch-token count does not match "
+                        f"num_query_tokens={self.num_input_query_tokens}."
+                    )
+                replacements.append((start, end, patch_mask, query_embeds))
+
+            segments = []
+            cursor = 0
+            for start, end, patch_mask, query_embeds in sorted(replacements, key=lambda item: item[0]):
+                segments.append(row_embeds[cursor:start])
+                original_segment = row_embeds[start:end]
+                patch_indices = patch_mask.cumsum(dim=0).sub(1).clamp_min(0)
+                query_values = query_embeds[patch_indices]
+                patched_segment = torch.where(patch_mask[:, None], query_values, original_segment)
+                segments.append(patched_segment)
+                cursor = end
+            segments.append(row_embeds[cursor:])
+            patched_rows.append(torch.cat(segments, dim=0))
+        return torch.stack(patched_rows, dim=0)
 
     def _run_fixed_layout_hidden(
         self,
@@ -253,7 +263,7 @@ class Qwen35Gr00t(TrainablePolicy):
         input_ids = qwen_inputs["input_ids"]
         attention_mask = qwen_inputs.get("attention_mask", None)
         mm_token_type_ids = qwen_inputs.get("mm_token_type_ids", None)
-        inputs_embeds = hf_model.get_input_embeddings()(input_ids)
+        inputs_embeds = hf_model.get_input_embeddings()(input_ids).clone()
 
         if qwen_inputs.get("pixel_values", None) is not None:
             image_outputs = hf_model.get_image_features(
@@ -354,7 +364,8 @@ class Qwen35Gr00t(TrainablePolicy):
                 targets.reshape(-1, targets.shape[-1]),
             )
         if not any(bool(flag) for flag in sample_mask):
-            return self._zero_loss(predictions.device), self._zero_loss(predictions.device)
+            zero = (predictions.sum() + targets.sum()) * 0.0
+            return zero, zero
         mask = torch.as_tensor(sample_mask, device=predictions.device, dtype=torch.bool)
         return self._nfp_loss(
             predictions[mask].reshape(-1, predictions.shape[-1]),
@@ -446,8 +457,6 @@ class Qwen35Gr00t(TrainablePolicy):
             zero = self._zero_loss(last_hidden.device)
             if event_inputs is None or event_positions is None or target_inputs is None:
                 return zero, zero
-            if sample_mask is not None and not any(bool(flag) for flag in sample_mask):
-                return zero, zero
             event_inputs = self._move_inputs_to_device(event_inputs, device)
             target_inputs = self._move_inputs_to_device(target_inputs, device)
             target_embeddings = self._build_target_image_embeddings(target_inputs)
@@ -483,33 +492,45 @@ class Qwen35Gr00t(TrainablePolicy):
         prev_cos = self._zero_loss(last_hidden.device)
         next_mse = self._zero_loss(last_hidden.device)
         next_cos = self._zero_loss(last_hidden.device)
+        half_mse = self._zero_loss(last_hidden.device)
+        half_cos = self._zero_loss(last_hidden.device)
+        compute_prev_events = float(self.nfp_config.prev_event_loss_weight) != 0.0
+        compute_next_events = float(self.nfp_config.next_event_loss_weight) != 0.0
+        compute_half_events = float(self.nfp_config.half_event_loss_weight) != 0.0
         long_event_records = []
         for group in qwen_long_event_groups:
-            group_prev_mse, group_prev_cos = compute_event_loss(
-                group.get("qwen_prev_inputs"),
-                group.get("qwen_prev_fixed_positions"),
-                group.get("qwen_prev_target_inputs"),
-                group.get("has_rnd_prev"),
-            )
-            group_next_mse, group_next_cos = compute_event_loss(
-                group.get("qwen_next_inputs"),
-                group.get("qwen_next_fixed_positions"),
-                group.get("qwen_next_target_inputs"),
-                group.get("has_rnd_next"),
-            )
+            group_prev_mse = self._zero_loss(last_hidden.device)
+            group_prev_cos = self._zero_loss(last_hidden.device)
+            group_next_mse = self._zero_loss(last_hidden.device)
+            group_next_cos = self._zero_loss(last_hidden.device)
+            if compute_prev_events:
+                group_prev_mse, group_prev_cos = compute_event_loss(
+                    group.get("qwen_prev_inputs"),
+                    group.get("qwen_prev_fixed_positions"),
+                    group.get("qwen_prev_target_inputs"),
+                    group.get("has_rnd_prev"),
+                )
+            if compute_next_events:
+                group_next_mse, group_next_cos = compute_event_loss(
+                    group.get("qwen_next_inputs"),
+                    group.get("qwen_next_fixed_positions"),
+                    group.get("qwen_next_target_inputs"),
+                    group.get("has_rnd_next"),
+                )
             prev_mse = prev_mse + group_prev_mse
             prev_cos = prev_cos + group_prev_cos
             next_mse = next_mse + group_next_mse
             next_cos = next_cos + group_next_cos
             long_event_records.append((group.get("mode", "event"), group_prev_mse, group_prev_cos, group_next_mse, group_next_cos))
 
-        half_mse, half_cos = compute_event_loss(
-            qwen_half_event_inputs,
-            qwen_half_event_fixed_positions,
-            qwen_half_event_target_inputs,
-            has_half_event,
-            use_short_head=False,
-        )
+        if compute_half_events:
+            half_mse, half_cos = compute_event_loss(
+                qwen_half_event_inputs,
+                qwen_half_event_fixed_positions,
+                qwen_half_event_target_inputs,
+                has_half_event,
+                use_short_head=False,
+            )
 
         loss_dict = {}
         if self.use_action_policy_loss:

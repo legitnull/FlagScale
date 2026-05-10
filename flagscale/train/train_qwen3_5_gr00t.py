@@ -501,12 +501,7 @@ def qwen_collate_fn(
 
     if use_fixed_layout:
         long_event_supervisions = [sample.get("long_event_supervisions", []) for sample in batch_list]
-        event_modes = []
-        for groups in long_event_supervisions:
-            for group in groups:
-                mode = group.get("mode", "event")
-                if mode not in event_modes:
-                    event_modes.append(mode)
+        event_modes = list(LeRobotMultiImageEventDataset.EVENT_MODES)
 
         qwen_long_event_groups = []
         for mode in event_modes:
@@ -566,27 +561,22 @@ def qwen_collate_fn(
 
         has_half_event = [bool(sample.get("has_half_event", False)) for sample in batch_list]
         batch["has_half_event"] = has_half_event
-        if any(has_half_event):
-            half_images = [
-                sample.get("half_event_images", []) if has_half_event[i] else batch_images[i]
-                for i, sample in enumerate(batch_list)
-            ]
-            half_directions = [sample.get("half_event_direction", "opposite") for sample in batch_list]
-            half_prompt = half_event_prompt or (
-                "The current task is: {instruction}. Given the current observation, "
-                "predict what the observation should look like in the {half_direction} half of this episode."
-            )
-            batch["qwen_half_event_inputs"], batch["qwen_half_event_fixed_positions"] = _build_fixed_layout_inputs(
-                batch_images,
-                instructions,
-                prompt=half_prompt,
-                replacements_per_sample=[{"half_direction": d or "opposite"} for d in half_directions],
-            )
-            batch["qwen_half_event_target_inputs"] = _build_inputs(half_images, instructions)
-        else:
-            batch["qwen_half_event_inputs"] = None
-            batch["qwen_half_event_fixed_positions"] = None
-            batch["qwen_half_event_target_inputs"] = None
+        half_images = [
+            sample.get("half_event_images", []) if has_half_event[i] else batch_images[i]
+            for i, sample in enumerate(batch_list)
+        ]
+        half_directions = [sample.get("half_event_direction", "opposite") for sample in batch_list]
+        half_prompt = half_event_prompt or (
+            "The current task is: {instruction}. Given the current observation, "
+            "predict what the observation should look like in the {half_direction} half of this episode."
+        )
+        batch["qwen_half_event_inputs"], batch["qwen_half_event_fixed_positions"] = _build_fixed_layout_inputs(
+            batch_images,
+            instructions,
+            prompt=half_prompt,
+            replacements_per_sample=[{"half_direction": d or "opposite"} for d in half_directions],
+        )
+        batch["qwen_half_event_target_inputs"] = _build_inputs(half_images, instructions)
 
     for key in all_image_keys:
         batch.pop(key, None)
@@ -1131,10 +1121,10 @@ def main(config: TrainConfig, seed: int):
 
     policy_config = PreTrainedConfig.from_train_config(config)
 
-    dist.init_process_group(backend=get_platform().dist_backend())
     local_rank = int(os.environ["LOCAL_RANK"])
     get_platform().set_device(local_rank)
     device = get_platform().device(local_rank)
+    dist.init_process_group(backend=get_platform().dist_backend())
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     is_main_process = rank == 0
@@ -1193,10 +1183,10 @@ def main(config: TrainConfig, seed: int):
         num_episodes = 1
     else:
         dataset = make_dataset(config, policy_config, seed=seed)
-        dist.barrier()
+        dist.barrier(device_ids=[local_rank])
 
         policy = make_policy(policy_config, dataset.meta)
-        dist.barrier()
+        dist.barrier(device_ids=[local_rank])
 
         dataset_stats = (
             dataset.merged_stats
@@ -1287,7 +1277,7 @@ def main(config: TrainConfig, seed: int):
     # Setup optimizer and scheduler (applies freeze config internally)
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(policy, config)
 
-    dist.barrier()
+    dist.barrier(device_ids=[local_rank])
 
     step = 0
     resume_from = config.system.checkpoint.resume_from
@@ -1513,7 +1503,7 @@ def main(config: TrainConfig, seed: int):
             config.system.checkpoint.save_checkpoint
             and step % config.system.checkpoint.save_freq == 0
         ):
-            dist.barrier()
+            dist.barrier(device_ids=[local_rank])
 
             # get_model_state_dict and get_optimizer_state_dict are collectives — all ranks must call
             options = StateDictOptions(full_state_dict=True, cpu_offload=True)
@@ -1543,12 +1533,12 @@ def main(config: TrainConfig, seed: int):
                 )
                 update_last_checkpoint(checkpoint_dir)
 
-            dist.barrier()
+            dist.barrier(device_ids=[local_rank])
 
     if is_main_process:
         logger.info("Training completed")
 
-    dist.barrier()
+    dist.barrier(device_ids=[local_rank])
     dist.destroy_process_group()
 
 
