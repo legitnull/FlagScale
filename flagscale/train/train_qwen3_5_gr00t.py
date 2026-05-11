@@ -585,22 +585,27 @@ def qwen_collate_fn(
 
         has_half_event = [bool(sample.get("has_half_event", False)) for sample in batch_list]
         batch["has_half_event"] = has_half_event
-        half_images = [
-            sample.get("half_event_images", []) if has_half_event[i] else batch_images[i]
-            for i, sample in enumerate(batch_list)
-        ]
-        half_directions = [sample.get("half_event_direction", "opposite") for sample in batch_list]
-        half_prompt = half_event_prompt or (
-            "The current task is: {instruction}. Given the current observation, "
-            "predict what the observation should look like in the {half_direction} half of this episode."
-        )
-        batch["qwen_half_event_inputs"], batch["qwen_half_event_fixed_positions"] = _build_fixed_layout_inputs(
-            batch_images,
-            instructions,
-            prompt=half_prompt,
-            replacements_per_sample=[{"half_direction": d or "opposite"} for d in half_directions],
-        )
-        batch["qwen_half_event_target_inputs"] = _build_inputs(half_images, instructions)
+        if any(has_half_event):
+            half_images = [
+                sample.get("half_event_images", []) if has_half_event[i] else batch_images[i]
+                for i, sample in enumerate(batch_list)
+            ]
+            half_directions = [sample.get("half_event_direction", "opposite") for sample in batch_list]
+            half_prompt = half_event_prompt or (
+                "The current task is: {instruction}. Given the current observation, "
+                "predict what the observation should look like in the {half_direction} half of this episode."
+            )
+            batch["qwen_half_event_inputs"], batch["qwen_half_event_fixed_positions"] = _build_fixed_layout_inputs(
+                batch_images,
+                instructions,
+                prompt=half_prompt,
+                replacements_per_sample=[{"half_direction": d or "opposite"} for d in half_directions],
+            )
+            batch["qwen_half_event_target_inputs"] = _build_inputs(half_images, instructions)
+        else:
+            batch["qwen_half_event_inputs"] = None
+            batch["qwen_half_event_fixed_positions"] = None
+            batch["qwen_half_event_target_inputs"] = None
     t_half_event = time.perf_counter() if timing else None
 
     for key in all_image_keys:

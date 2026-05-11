@@ -290,12 +290,10 @@ class LeRobotMultiImageEventDataset(LeRobotDataset):
             neighbors["mode"] = mode
             groups.append(neighbors)
 
-        if groups:
-            return {"long_event_supervisions": groups, "half_event": None}
-        return {
-            "long_event_supervisions": [],
-            "half_event": self._sample_half_event(ep_idx, base_abs_idx, current_task, rng),
-        }
+        # If subtask/atomic event indices are unavailable, keep the sample as
+        # short-future supervision only. The previous half-episode fallback can
+        # cross event boundaries and dilute the intended event-causal target.
+        return {"long_event_supervisions": groups, "half_event": None}
 
     @staticmethod
     def _tensor_to_pil(t: torch.Tensor) -> Image.Image:
@@ -365,7 +363,7 @@ class LeRobotMultiImageEventDataset(LeRobotDataset):
         item["half_event_images"] = half_event_images
         item["half_event_direction"] = half_event.get("direction", "") if half_event else ""
         item["has_half_event"] = bool(half_event_images)
-        item["event_mode"] = "joint" if long_event_supervisions else "half_episode"
+        item["event_mode"] = "joint" if long_event_supervisions else "short_future_only"
         if timing:
             t_end = time.perf_counter()
             self._timing_count += 1

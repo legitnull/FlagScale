@@ -453,10 +453,24 @@ class Qwen35Gr00t(TrainablePolicy):
         )
         nfp_feature = short_outputs.detach().clone()
 
+        used_long_event_head = False
+
+        def zero_connect_long_event_head() -> torch.Tensor:
+            long_features = self._slice_query_hidden(
+                last_hidden, qwen_inputs, qwen_fixed_positions, "long_query_start", "long_query_end"
+            ).to(dtype=head_dtype)
+            # Keep the event head in the distributed graph without adding a fake supervision target.
+            long_probe = long_features[:, :1, :].reshape(-1, long_features.shape[-1])
+            long_outputs = self.long_event_head(long_probe)
+            return long_outputs.sum() * 0.0
+
         def compute_event_loss(event_inputs, event_positions, target_inputs, sample_mask, use_short_head=False):
+            nonlocal used_long_event_head
             zero = self._zero_loss(last_hidden.device)
             if event_inputs is None or event_positions is None or target_inputs is None:
                 return zero, zero
+            # Keep event forward counts identical across distributed ranks. Fully masked
+            # groups still use dummy targets and contribute zero loss via the mask.
             event_inputs = self._move_inputs_to_device(event_inputs, device)
             target_inputs = self._move_inputs_to_device(target_inputs, device)
             target_embeddings = self._build_target_image_embeddings(target_inputs)
@@ -482,6 +496,8 @@ class Qwen35Gr00t(TrainablePolicy):
             ).to(dtype=head_dtype)
             head = short_head if use_short_head else self.long_event_head
             event_outputs = head(event_features.reshape(-1, event_features.shape[-1]))
+            if not use_short_head:
+                used_long_event_head = True
             event_outputs = event_outputs.reshape(event_features.shape[0], event_features.shape[1], -1)
             event_outputs = self._slice_supervised_tail(
                 event_outputs, event_targets.shape[1], "half event" if use_short_head else "long event"
@@ -559,6 +575,8 @@ class Qwen35Gr00t(TrainablePolicy):
         loss = loss + self.nfp_config.prev_event_loss_weight * prev_loss
         loss = loss + self.nfp_config.next_event_loss_weight * next_loss
         loss = loss + self.nfp_config.half_event_loss_weight * half_loss
+        if not used_long_event_head and (compute_prev_events or compute_next_events or compute_half_events):
+            loss = loss + zero_connect_long_event_head()
         loss = loss + self._auxiliary_zero_connected_loss(last_hidden.device)
 
         loss_dict.update({

@@ -59,7 +59,7 @@ model:
     short_future_loss_weight: 1.0
     prev_event_loss_weight: 0.5
     next_event_loss_weight: 0.5
-    half_event_loss_weight: 0.5
+    half_event_loss_weight: 0.0
     # Must match data.fixed_layout.num_query_tokens when fixed-layout WM is enabled.
     num_query_tokens: 256
     learnable_query_tokens: true
