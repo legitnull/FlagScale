@@ -2,7 +2,7 @@ system:
   batch_size: 2
   vla_gradient_accumulation_steps: 2
   train_steps: 279000
-  log_freq: 1
+  log_freq: 10
   grad_clip_norm: 1.0
   use_amp: true
   shuffle: true
