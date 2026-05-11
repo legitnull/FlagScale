@@ -21,6 +21,10 @@ DATASET_MIXTURES: dict[str, list[tuple[str, float]]] = {
         ("egocentric10k", 1.0),
         ("egodex", 1.0),
         ("kinetics", 1.0),
+        ("llava-178k", 1.0),
+        ("pe_video_extended", 1.0),
+        ("pe_video_traintest", 1.0),
+        ("psi_ego", 1.0),
     ],
     "ego1": [
         ("EgoExoLearn_1fps", 1.0),

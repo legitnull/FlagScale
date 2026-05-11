@@ -1,12 +1,13 @@
 system:
-  batch_size: 1
-  train_steps: 150000
+  batch_size: 2
+  vla_gradient_accumulation_steps: 2
+  train_steps: 279000
   log_freq: 1
   grad_clip_norm: 1.0
   use_amp: true
   shuffle: true
   num_workers: 16
-  vlm_loss_scale: 0.1
+  vlm_loss_scale: 0.4
 
   checkpoint:
     output_directory: ${experiment.exp_dir}
@@ -56,9 +57,9 @@ model:
     vlm_feature_layer: -1
     nfp_loss_mse_weight: 0.1
     nfp_loss_cosine_weight: 1.0
-    short_future_loss_weight: 1.0
-    prev_event_loss_weight: 0.5
-    next_event_loss_weight: 0.5
+    short_future_loss_weight: 0.1
+    prev_event_loss_weight: 0.25
+    next_event_loss_weight: 0.25
     half_event_loss_weight: 0.0
     # Must match data.fixed_layout.num_query_tokens when fixed-layout WM is enabled.
     num_query_tokens: 256

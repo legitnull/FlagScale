@@ -69,6 +69,9 @@ from flagscale.train.utils.train_utils import (
 )
 
 
+_FIXED_POSITION_LOG_COUNT = 0
+
+
 class LeRobotDatasetWithFutureFrames(LeRobotDataset):
     """LeRobotDataset subclass that splits future frames from visual tensors.
 
@@ -501,6 +504,50 @@ def qwen_collate_fn(
             "attention_mask": torch.stack(masks),
             "mm_token_type_ids": torch.stack(padded_mm),
         }
+
+        for sample_idx, ids in enumerate(batch_input["input_ids"]):
+            seq_len = int(batch_input["attention_mask"][sample_idx].numel())
+            image_end = int(fixed_positions["image_end"][sample_idx])
+            short_start = int(fixed_positions["short_query_start"][sample_idx])
+            short_end = int(fixed_positions["short_query_end"][sample_idx])
+            instruction_start = int(fixed_positions["instruction_start"][sample_idx])
+            instruction_end = int(fixed_positions["instruction_end"][sample_idx])
+            long_start = int(fixed_positions["long_query_start"][sample_idx])
+            long_end = int(fixed_positions["long_query_end"][sample_idx])
+            if not (0 <= image_end < short_start <= short_end < instruction_start <= instruction_end < long_start <= long_end < seq_len):
+                raise ValueError(
+                    "Invalid fixed-layout positions: "
+                    f"sample={sample_idx} image_end={image_end} "
+                    f"short=({short_start},{short_end}) instruction=({instruction_start},{instruction_end}) "
+                    f"long=({long_start},{long_end}) seq_len={seq_len}"
+                )
+            for name, start, end in (
+                ("short", short_start, short_end),
+                ("long", long_start, long_end),
+            ):
+                query_ids = ids[start:end + 1]
+                query_mask = (query_ids != vision_start_token_id) & (query_ids != vision_end_token_id)
+                patch_count = int(query_mask.sum().item())
+                if patch_count != num_query_tokens:
+                    raise ValueError(
+                        f"Invalid {name} query patch-token count: sample={sample_idx} "
+                        f"got={patch_count} expected={num_query_tokens} "
+                        f"range=({start},{end})"
+                    )
+
+        global _FIXED_POSITION_LOG_COUNT
+        debug_limit = int(os.environ.get("WM_DEBUG_FIXED_POSITIONS", "0") or 0)
+        if debug_limit > _FIXED_POSITION_LOG_COUNT:
+            _FIXED_POSITION_LOG_COUNT += 1
+            logger.info(
+                "[fixed_position_check] "
+                f"batch={len(sample_inputs)} seq_len={batch_input["input_ids"].shape[1]} "
+                f"query_patch_tokens={num_query_tokens} query_block_tokens={fixed_positions["query_block_tokens"]} "
+                f"sample0_image_end={image_ends[0]} "
+                f"sample0_short=({short_starts[0]},{short_ends[0]}) "
+                f"sample0_instruction=({instruction_starts[0]},{instruction_ends[0]}) "
+                f"sample0_long=({long_starts[0]},{long_ends[0]})"
+            )
         if all_pixel_values:
             batch_input["pixel_values"] = torch.cat(all_pixel_values, dim=0)
         if all_image_grid_thw:
@@ -1103,15 +1150,29 @@ def update_policy(
         else nullcontext()
     )
 
-    with torch.profiler.record_function("forward_vla"):
-        with autocast_context:
-            output = policy(batch)
-            vla_loss = output["loss"]
+    vla_batches = batch if isinstance(batch, list) else [batch]
+    vla_outputs = []
+    for micro_idx, vla_batch in enumerate(vla_batches):
+        is_last_vla = micro_idx == len(vla_batches) - 1
+        with torch.profiler.record_function("forward_vla"):
+            with autocast_context:
+                micro_output = policy(vla_batch)
+                vla_outputs.append(micro_output)
+                vla_loss = micro_output["loss"] / len(vla_batches)
 
-    with torch.profiler.record_function("backward_vla"):
-        if vlm_batch is not None:
-            policy.set_is_last_backward(False)
-        vla_loss.backward()
+        with torch.profiler.record_function("backward_vla"):
+            if hasattr(policy, "set_is_last_backward"):
+                policy.set_is_last_backward(is_last_vla and vlm_batch is None)
+            vla_loss.backward()
+
+    if not vla_outputs:
+        raise RuntimeError("update_policy received no VLA batches")
+
+    output = dict(vla_outputs[-1])
+    for key in vla_outputs[-1].keys():
+        values = [out[key] for out in vla_outputs if key in out and torch.is_tensor(out[key]) and out[key].ndim == 0]
+        if len(values) == len(vla_outputs):
+            output[key] = torch.stack([value.detach() for value in values]).mean()
 
     if vlm_batch is not None:
         with torch.profiler.record_function("forward_vlm"):
@@ -1153,6 +1214,17 @@ def update_policy(
         train_metrics.nfp_mse_loss = output["nfp_mse_loss_0"].item()
     if "nfp_cosine_loss_0" in output and "nfp_cosine_loss" in train_metrics.metrics:
         train_metrics.nfp_cosine_loss = output["nfp_cosine_loss_0"].item()
+    if "short_future_loss_0" in output and "short_future_loss" in train_metrics.metrics:
+        train_metrics.short_future_loss = output["short_future_loss_0"].item()
+    if "prev_event_loss" in output and "prev_event_loss" in train_metrics.metrics:
+        train_metrics.prev_event_loss = output["prev_event_loss"].item()
+    if "next_event_loss" in output and "next_event_loss" in train_metrics.metrics:
+        train_metrics.next_event_loss = output["next_event_loss"].item()
+    if "long_event_loss" in train_metrics.metrics:
+        prev_loss = output.get("prev_event_loss")
+        next_loss = output.get("next_event_loss")
+        if prev_loss is not None and next_loss is not None:
+            train_metrics.long_event_loss = (prev_loss + next_loss).item()
     if "vlm_loss" in output and "vlm_loss" in train_metrics.metrics:
         train_metrics.vlm_loss = output["vlm_loss"].item() * vlm_loss_scale
 
@@ -1348,6 +1420,10 @@ def main(config: TrainConfig, seed: int):
         "action_loss": AverageMeter("act_loss", ":.3f"),
         "nfp_mse_loss": AverageMeter("nfp_mse", ":.4f"),
         "nfp_cosine_loss": AverageMeter("nfp_cos", ":.4f"),
+        "short_future_loss": AverageMeter("short_q", ":.3f"),
+        "prev_event_loss": AverageMeter("prev_q", ":.3f"),
+        "next_event_loss": AverageMeter("next_q", ":.3f"),
+        "long_event_loss": AverageMeter("long_q", ":.3f"),
         "grad_norm": AverageMeter("grdn", ":.3f"),
         "lr": AverageMeter("lr", ":0.1e"),
         "update_s": AverageMeter("updt_s", ":.3f"),
@@ -1442,13 +1518,19 @@ def main(config: TrainConfig, seed: int):
             f"[Profiler] Rank {rank}: enabled. Traces -> {profiler_output_dir}"
         )
 
+    vla_gradient_accumulation_steps = max(1, int(getattr(config.system, "vla_gradient_accumulation_steps", 1)))
+
     for _ in range(step, config.system.train_steps):
         # --- Dataloader phase ---
         with torch.profiler.record_function("dataloader_vla"):
             start_time = time.perf_counter()
-            batch = _next_vla_batch()
-            if isinstance(batch, dict):
-                batch = {k: _to_device(v, device) for k, v in batch.items()}
+            vla_micro_batches = []
+            for _micro_idx in range(vla_gradient_accumulation_steps):
+                micro_batch = _next_vla_batch()
+                if isinstance(micro_batch, dict):
+                    micro_batch = {k: _to_device(v, device) for k, v in micro_batch.items()}
+                vla_micro_batches.append(micro_batch)
+            batch = vla_micro_batches[0] if vla_gradient_accumulation_steps == 1 else vla_micro_batches
 
         with torch.profiler.record_function("dataloader_vlm"):
             if vlm_dl_iter is not None:
@@ -1486,7 +1568,10 @@ def main(config: TrainConfig, seed: int):
 
         with torch.profiler.record_function("preprocessor"):
             if preprocessor is not None:
-                batch = preprocessor(batch)
+                if isinstance(batch, list):
+                    batch = [preprocessor(micro_batch) for micro_batch in batch]
+                else:
+                    batch = preprocessor(batch)
             train_tracker.dataloading_s = time.perf_counter() - start_time
 
         # Debug: log tensor shapes and GPU memory for memory profiling
@@ -1511,7 +1596,7 @@ def main(config: TrainConfig, seed: int):
                         f"[{name}] rank={rank} "
                         + ", ".join(parts)
                     )
-            _log_batch_shapes("VLA_batch", batch)
+            _log_batch_shapes("VLA_batch", batch[0] if isinstance(batch, list) else batch)
             _log_batch_shapes("VLM_batch", vlm_batch)
 
         with torch.profiler.record_function("update_policy"):
