@@ -47,6 +47,7 @@ from flagscale.train.datasets.lerobot_dataset import (
     LeRobotDatasetMetadata,
 )
 from flagscale.train.datasets.lerobot_mixture_dataset import LeRobotMixtureDataset
+from flagscale.train.datasets.lerobot_multiimage_event_dataset import LeRobotMultiImageEventDataset
 from flagscale.train.datasets.utils import (
     dataset_to_policy_features,
     get_hf_features_from_features,
@@ -71,6 +72,9 @@ from flagscale.train.utils.train_utils import (
     save_checkpoint,
     update_last_checkpoint,
 )
+
+
+_FIXED_POSITION_LOG_COUNT = 0
 
 
 class LeRobotDatasetWithFutureFrames(LeRobotDataset):
@@ -197,36 +201,122 @@ class LeRobotDatasetWithFutureFrames(LeRobotDataset):
         return item
 
 
+class SkipBatch(RuntimeError):
+    """Raised by qwen_collate_fn when every sample in a batch is corrupted
+    (has ``None`` fields). The training loop catches this and fetches the
+    next batch instead of crashing the whole job."""
+
+
+def _scalarize(v):
+    """Best-effort convert a 0-d/1-elem tensor to a Python scalar, else return as-is."""
+    if isinstance(v, torch.Tensor):
+        try:
+            return v.item()
+        except Exception:
+            return v.tolist()
+    return v
+
+
+def _resize_pil_images(images, target_size=(256, 256)):
+    """Recursively resize PIL images, matching starVLA's resize_images pattern."""
+    if isinstance(images, Image.Image):
+        return images.resize(target_size)
+    if isinstance(images, list):
+        return [_resize_pil_images(img, target_size=target_size) for img in images]
+    raise ValueError(f"Unsupported image type or structure: {type(images)}")
+
+
 def qwen_collate_fn(
     batch_list: list[dict],
     *,
     processor,
     prompt_template: str,
     image_feature_keys: list[str],
+    image_size: tuple[int, int] | None = (256, 256),
+    fixed_layout_config: dict | None = None,
+    prev_event_prompt: str | None = None,
+    next_event_prompt: str | None = None,
+    half_event_prompt: str | None = None,
 ) -> dict:
     """Collate samples into a batch with tokenized Qwen processor inputs.
 
-    PIL images can't go through default_collate, so we pull them out first,
-    collate the rest (action, state, etc.), then build Qwen inputs from the
-    PIL images + task instructions.
-
-    Adds ``qwen_inputs`` and (if future frames exist) ``qwen_future_inputs``
-    to the batch dict.
+    In the default path this emits the existing ``qwen_inputs`` and
+    ``qwen_future_inputs`` fields. When ``fixed_layout_config.enabled`` is true,
+    it instead builds the two-query layout used by the WM event objective:
+    ``image -> short query -> instruction -> long query`` plus fixed token
+    positions and optional event target groups.
     """
+    timing_enabled = os.getenv("FS_WM_DATA_TIMING", "0") == "1"
+    if not hasattr(qwen_collate_fn, "_timing_count"):
+        qwen_collate_fn._timing_count = 0
+    timing_limit = int(os.getenv("FS_WM_COLLATE_TIMING_LIMIT", "8"))
+    timing = timing_enabled and qwen_collate_fn._timing_count < timing_limit
+    t0 = time.perf_counter() if timing else None
+
     future_keys = [f"{k}_future" for k in image_feature_keys]
     all_image_keys = set(image_feature_keys) | set(future_keys)
+    event_payload_keys = {
+        "long_event_supervisions",
+        "half_event_images",
+        "half_event_direction",
+        "has_half_event",
+        "event_mode",
+    }
+    optional_none_keys = event_payload_keys | {
+        "task_index",
+        "subtask_index",
+        "atomic_index",
+    }
 
-    # Separate PIL images from tensor-compatible fields
+    optional_index_keys = {"task_index", "subtask_index", "atomic_index"}
+
+    def _normalize_optional_index(value):
+        if value is None:
+            return torch.tensor(-1, dtype=torch.long)
+        if isinstance(value, torch.Tensor):
+            return value.to(dtype=torch.long)
+        return torch.as_tensor(value, dtype=torch.long)
+
+    original_size = len(batch_list)
+    cleaned: list[dict] = []
+    for idx, sample in enumerate(batch_list):
+        none_keys = [
+            k for k, v in sample.items()
+            if v is None and k not in optional_none_keys
+        ]
+        if none_keys:
+            ep = _scalarize(sample.get("episode_index"))
+            fr = _scalarize(sample.get("frame_index"))
+            ds_idx = _scalarize(sample.get("dataset_index"))
+            print(
+                f"[qwen_collate_fn] DROP bad sample batch_idx={idx} "
+                f"dataset_index={ds_idx} episode_index={ep} frame_index={fr} "
+                f"none_keys={none_keys}",
+                flush=True,
+            )
+            continue
+        sample = dict(sample)
+        for key in optional_index_keys:
+            sample[key] = _normalize_optional_index(sample.get(key))
+        cleaned.append(sample)
+    if not cleaned:
+        raise SkipBatch(
+            f"all {original_size} samples in this batch had None fields; skipping"
+        )
+    batch_list = cleaned
+
     image_data: dict[str, list[Image.Image]] = {}
     for key in all_image_keys:
         if key in batch_list[0]:
             image_data[key] = [sample[key] for sample in batch_list]
 
     non_image_batch = [
-        {k: v for k, v in sample.items() if k not in all_image_keys} for sample in batch_list
+        {k: v for k, v in sample.items() if k not in all_image_keys and k not in event_payload_keys}
+        for sample in batch_list
     ]
     batch = torch.utils.data.default_collate(non_image_batch)
     batch.update(image_data)
+    t_default_collate = time.perf_counter() if timing else None
 
     instructions = batch["task"]
     if isinstance(instructions, torch.Tensor):
@@ -234,12 +324,7 @@ def qwen_collate_fn(
     if isinstance(instructions, str):
         instructions = [instructions]
 
-    def _build_inputs(feature_keys: list[str]):
-        """Build Qwen processor inputs from PIL images across camera keys.
-
-        Groups images per sample: [[cam1, cam2, ...], [cam1, cam2, ...], ...]
-        then formats as Qwen chat messages for tokenization.
-        """
+    def _images_for_keys(feature_keys: list[str]) -> list[list[Image.Image]]:
         batch_images: list[list[Image.Image]] | None = None
         for key in feature_keys:
             imgs = batch[key]
@@ -250,29 +335,47 @@ def qwen_collate_fn(
             else:
                 for sample_imgs, img in zip(batch_images, imgs):
                     sample_imgs.append(img)
+        if batch_images is None:
+            raise ValueError(f"No images found for feature keys: {feature_keys}")
+        if image_size is not None:
+            batch_images = _resize_pil_images(batch_images, target_size=image_size)
+        return batch_images
 
+    def _render_prompt(instruction, prompt=None, replacements=None):
+        if prompt:
+            out = prompt.replace("{instruction}", str(instruction)).replace("{inst}", str(instruction))
+            if replacements:
+                for key, value in replacements.items():
+                    out = out.replace("{" + key + "}", str(value))
+            return out
+        if prompt_template:
+            return prompt_template.replace("{instruction}", str(instruction))
+        return str(instruction)
+
+    def _build_messages(images, texts, prompt=None, replacements_per_sample=None):
+        replacements_iter = replacements_per_sample or [None] * len(images)
         messages = []
-        for imgs, instruction in zip(batch_images, instructions):
+        for imgs, instruction, replacements in zip(images, texts, replacements_iter):
             content = [{"type": "image", "image": img} for img in imgs]
-            prompt = (
-                prompt_template.replace("{instruction}", instruction)
-                if prompt_template
-                else instruction
-            )
-            content.append({"type": "text", "text": prompt})
+            content.append({"type": "text", "text": _render_prompt(instruction, prompt, replacements)})
             messages.append([{"role": "user", "content": content}])
+        return messages
 
-        # NOTE: apply_chat_template(tokenize=True) is simpler but uses the processor's
-        # min/max_pixels config for resizing, which differs from process_vision_info's
-        # qwen_vl_utils defaults (e.g. 256x256 → 252x252 vs different size). Sticking
-        # with the 3-step API for now.
-        texts = [
-            processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True)
+    def _build_inputs(images, texts, prompt=None, replacements_per_sample=None):
+        messages = _build_messages(images, texts, prompt, replacements_per_sample)
+        rendered = [
+            processor.apply_chat_template(
+                m, tokenize=False, add_generation_prompt=True, enable_thinking=False
+            )
             for m in messages
         ]
         image_inputs, video_inputs = process_vision_info(messages)
-        result = processor(
-            text=texts, images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt"
+        result= processor(
+            text=rendered,
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
         )
 
         # Debug: log if any sequence exceeds model_max_length
@@ -299,19 +402,305 @@ def qwen_collate_fn(
 
         return result
 
-    batch["qwen_inputs"] = _build_inputs(image_feature_keys)
+    def _extract_fixed_layout_parts(single_inputs):
+        vision_start_token_id = 248053
+        vision_end_token_id = 248054
+        ids = single_inputs["input_ids"][0]
+        attention_mask = single_inputs["attention_mask"][0]
+        mm_token_type_ids = single_inputs.get("mm_token_type_ids", torch.zeros_like(ids))[0]
+        valid = attention_mask.to(torch.bool)
+        ids = ids[valid]
+        mm_token_type_ids = mm_token_type_ids[valid]
+        vision_starts = torch.nonzero(ids == vision_start_token_id, as_tuple=False).flatten()
+        vision_ends = torch.nonzero(ids == vision_end_token_id, as_tuple=False).flatten()
+        if vision_starts.numel() == 0 or vision_ends.numel() == 0:
+            raise ValueError("Fixed layout requires at least one image block in each VLA sample.")
+        image_start = int(vision_starts[0].item())
+        image_end = int(vision_ends[-1].item())
+        return (
+            ids[image_start:image_end + 1],
+            mm_token_type_ids[image_start:image_end + 1],
+            ids[image_end + 1:],
+            mm_token_type_ids[image_end + 1:],
+        )
+
+    def _build_fixed_layout_inputs(images, texts, prompt=None, replacements_per_sample=None):
+        cfg = dict(fixed_layout_config or {})
+        if not cfg.get("enabled", False):
+            raise ValueError("fixed_layout_config.enabled must be true for fixed-layout inputs.")
+        num_query_tokens = int(cfg.get("num_query_tokens", 32))
+        instruction_max_tokens = int(cfg.get("instruction_max_tokens", 192))
+        pad_token_id = processor.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = processor.tokenizer.eos_token_id
+        vision_start_token_id = 248053
+        vision_end_token_id = 248054
+
+        def build_single_inputs(imgs, text, replacements=None):
+            return _build_inputs(
+                [imgs],
+                [text],
+                prompt=prompt,
+                replacements_per_sample=[replacements] if replacements is not None else None,
+            )
+
+        def build_query_wrapped_like_image(image_ids, image_mm):
+            starts = torch.nonzero(image_ids == vision_start_token_id, as_tuple=False).flatten()
+            ends = torch.nonzero(image_ids == vision_end_token_id, as_tuple=False).flatten()
+            if starts.numel() == 0 or starts.numel() != ends.numel():
+                raise ValueError("Cannot mirror query wrappers because image start/end tokens are malformed.")
+            first_start = int(starts[0].item())
+            first_end = int(ends[0].item())
+            per_image_query_tokens = first_end - first_start - 1
+            if per_image_query_tokens <= 0 or num_query_tokens % per_image_query_tokens != 0:
+                raise ValueError(
+                    f"num_query_tokens={num_query_tokens} must be divisible by "
+                    f"per_image_query_tokens={per_image_query_tokens}."
+                )
+            query_image_count = num_query_tokens // per_image_query_tokens
+            start_token = image_ids[first_start:first_start + 1]
+            start_mm = image_mm[first_start:first_start + 1]
+            end_token = image_ids[first_end:first_end + 1]
+            end_mm = image_mm[first_end:first_end + 1]
+            wrapped_ids, wrapped_mm = [], []
+            for image_idx in range(query_image_count):
+                patch_ids = torch.full((per_image_query_tokens,), pad_token_id, dtype=torch.long)
+                patch_mm = torch.zeros((per_image_query_tokens,), dtype=torch.long)
+                wrapped_ids.extend([start_token, patch_ids, end_token])
+                wrapped_mm.extend([start_mm, patch_mm, end_mm])
+            return torch.cat(wrapped_ids), torch.cat(wrapped_mm)
+
+        replacements_iter = replacements_per_sample or [None] * len(images)
+        sample_inputs = []
+        for imgs, text, replacements in zip(images, texts, replacements_iter):
+            single = build_single_inputs(imgs, text, replacements)
+            image_ids, image_mm, instruction_ids, instruction_mm = _extract_fixed_layout_parts(single)
+            if instruction_ids.numel() > instruction_max_tokens:
+                instruction_ids = instruction_ids[-instruction_max_tokens:]
+                instruction_mm = instruction_mm[-instruction_max_tokens:]
+            short_query_ids, short_query_mm = build_query_wrapped_like_image(image_ids, image_mm)
+            long_query_ids, long_query_mm = build_query_wrapped_like_image(image_ids, image_mm)
+            ids = torch.cat([image_ids, short_query_ids, instruction_ids, long_query_ids])
+            mm = torch.cat([image_mm, short_query_mm, instruction_mm, long_query_mm])
+            sample_inputs.append((single, ids, mm, image_ids.numel(), short_query_ids.numel(), instruction_ids.numel()))
+
+        batch_seq_len = max(int(ids.numel()) for _, ids, *_ in sample_inputs)
+        padded_ids, masks, padded_mm = [], [], []
+        image_ends, short_starts, short_ends = [], [], []
+        instruction_starts, instruction_ends, long_starts, long_ends = [], [], [], []
+        all_pixel_values, all_image_grid_thw = [], []
+        for single, ids, mm, image_len, query_len, instruction_len in sample_inputs:
+            left_pad_len = batch_seq_len - ids.numel()
+            left_ids = torch.full((left_pad_len,), pad_token_id, dtype=torch.long)
+            left_mm = torch.zeros((left_pad_len,), dtype=torch.long)
+            padded_ids.append(torch.cat([left_ids, ids]))
+            padded_mm.append(torch.cat([left_mm, mm]))
+            masks.append(torch.cat([torch.zeros((left_pad_len,), dtype=torch.long), torch.ones_like(ids)]))
+            image_end = left_pad_len + image_len - 1
+            short_start = left_pad_len + image_len
+            short_end = short_start + query_len - 1
+            instruction_start = short_end + 1
+            instruction_end = instruction_start + instruction_len - 1
+            long_start = batch_seq_len - query_len
+            long_end = batch_seq_len - 1
+            image_ends.append(image_end)
+            short_starts.append(short_start)
+            short_ends.append(short_end)
+            instruction_starts.append(instruction_start)
+            instruction_ends.append(instruction_end)
+            long_starts.append(long_start)
+            long_ends.append(long_end)
+            if "pixel_values" in single:
+                all_pixel_values.append(single["pixel_values"])
+            if "image_grid_thw" in single:
+                all_image_grid_thw.append(single["image_grid_thw"])
+
+        fixed_positions = {
+            "image_end": torch.tensor(image_ends, dtype=torch.long),
+            "query_start": torch.tensor(short_starts, dtype=torch.long),
+            "query_end": torch.tensor(short_ends, dtype=torch.long),
+            "short_query_start": torch.tensor(short_starts, dtype=torch.long),
+            "short_query_end": torch.tensor(short_ends, dtype=torch.long),
+            "instruction_start": torch.tensor(instruction_starts, dtype=torch.long),
+            "instruction_end": torch.tensor(instruction_ends, dtype=torch.long),
+            "long_query_start": torch.tensor(long_starts, dtype=torch.long),
+            "long_query_end": torch.tensor(long_ends, dtype=torch.long),
+            "query_patch_tokens": num_query_tokens,
+            "query_block_tokens": max(x[4] for x in sample_inputs),
+        }
+        batch_input = {
+            "input_ids": torch.stack(padded_ids),
+            "attention_mask": torch.stack(masks),
+            "mm_token_type_ids": torch.stack(padded_mm),
+        }
+
+        for sample_idx, ids in enumerate(batch_input["input_ids"]):
+            seq_len = int(batch_input["attention_mask"][sample_idx].numel())
+            image_end = int(fixed_positions["image_end"][sample_idx])
+            short_start = int(fixed_positions["short_query_start"][sample_idx])
+            short_end = int(fixed_positions["short_query_end"][sample_idx])
+            instruction_start = int(fixed_positions["instruction_start"][sample_idx])
+            instruction_end = int(fixed_positions["instruction_end"][sample_idx])
+            long_start = int(fixed_positions["long_query_start"][sample_idx])
+            long_end = int(fixed_positions["long_query_end"][sample_idx])
+            if not (0 <= image_end < short_start <= short_end < instruction_start <= instruction_end < long_start <= long_end < seq_len):
+                raise ValueError(
+                    "Invalid fixed-layout positions: "
+                    f"sample={sample_idx} image_end={image_end} "
+                    f"short=({short_start},{short_end}) instruction=({instruction_start},{instruction_end}) "
+                    f"long=({long_start},{long_end}) seq_len={seq_len}"
+                )
+            for name, start, end in (
+                ("short", short_start, short_end),
+                ("long", long_start, long_end),
+            ):
+                query_ids = ids[start:end + 1]
+                query_mask = (query_ids != vision_start_token_id) & (query_ids != vision_end_token_id)
+                patch_count = int(query_mask.sum().item())
+                if patch_count != num_query_tokens:
+                    raise ValueError(
+                        f"Invalid {name} query patch-token count: sample={sample_idx} "
+                        f"got={patch_count} expected={num_query_tokens} "
+                        f"range=({start},{end})"
+                    )
+
+        global _FIXED_POSITION_LOG_COUNT
+        debug_limit = int(os.environ.get("WM_DEBUG_FIXED_POSITIONS", "0") or 0)
+        if debug_limit > _FIXED_POSITION_LOG_COUNT:
+            _FIXED_POSITION_LOG_COUNT += 1
+            logger.info(
+                "[fixed_position_check] "
+                f"batch={len(sample_inputs)} seq_len={batch_input["input_ids"].shape[1]} "
+                f"query_patch_tokens={num_query_tokens} query_block_tokens={fixed_positions["query_block_tokens"]} "
+                f"sample0_image_end={image_ends[0]} "
+                f"sample0_short=({short_starts[0]},{short_ends[0]}) "
+                f"sample0_instruction=({instruction_starts[0]},{instruction_ends[0]}) "
+                f"sample0_long=({long_starts[0]},{long_ends[0]})"
+            )
+        if all_pixel_values:
+            batch_input["pixel_values"] = torch.cat(all_pixel_values, dim=0)
+        if all_image_grid_thw:
+            batch_input["image_grid_thw"] = torch.cat(all_image_grid_thw, dim=0)
+        return batch_input, fixed_positions
+
+    batch_images = _images_for_keys(image_feature_keys)
+    t_current_images = time.perf_counter() if timing else None
+    use_fixed_layout = bool((fixed_layout_config or {}).get("enabled", False))
+    if use_fixed_layout:
+        batch["qwen_inputs"], batch["qwen_fixed_positions"] = _build_fixed_layout_inputs(
+            batch_images, instructions
+        )
+    else:
+        batch["qwen_inputs"] = _build_inputs(batch_images, instructions)
+    t_qwen_current = time.perf_counter() if timing else None
 
     if future_keys and future_keys[0] in batch:
-        batch["qwen_future_inputs"] = _build_inputs(future_keys)
+        batch["qwen_future_inputs"] = _build_inputs(_images_for_keys(future_keys), instructions)
+    t_qwen_future = time.perf_counter() if timing else None
 
-    # Remove raw PIL images — they've been consumed by the processor above.
-    # Leaving them would break downstream steps (e.g. normalize_processor)
-    # that expect tensors.
+    if use_fixed_layout:
+        long_event_supervisions = [sample.get("long_event_supervisions", []) for sample in batch_list]
+        event_modes = list(LeRobotMultiImageEventDataset.EVENT_MODES)
+
+        qwen_long_event_groups = []
+        for mode in event_modes:
+            per_sample_groups = [
+                next((g for g in groups if g.get("mode", "event") == mode), None)
+                for groups in long_event_supervisions
+            ]
+            prev_target_images = [
+                group["prev_images"] if group and group.get("has_prev", False) else batch_images[i]
+                for i, group in enumerate(per_sample_groups)
+            ]
+            next_target_images = [
+                group["next_images"] if group and group.get("has_next", False) else batch_images[i]
+                for i, group in enumerate(per_sample_groups)
+            ]
+            prev_event_langs = [
+                group.get("prev_lang", "") if group and group.get("has_prev", False) else instructions[i]
+                for i, group in enumerate(per_sample_groups)
+            ]
+            next_event_langs = [
+                group.get("next_lang", "") if group and group.get("has_next", False) else instructions[i]
+                for i, group in enumerate(per_sample_groups)
+            ]
+            has_prev = [bool(group and group.get("has_prev", False)) for group in per_sample_groups]
+            has_next = [bool(group and group.get("has_next", False)) for group in per_sample_groups]
+            event_type = mode.replace("_", " ")
+            qwen_prev_inputs, qwen_prev_fixed_positions = _build_fixed_layout_inputs(
+                batch_images,
+                instructions,
+                prompt=prev_event_prompt,
+                replacements_per_sample=[
+                    {"prev_instruction": text, "event_type": event_type, "event_mode": mode}
+                    for text in prev_event_langs
+                ],
+            )
+            qwen_next_inputs, qwen_next_fixed_positions = _build_fixed_layout_inputs(
+                batch_images,
+                instructions,
+                prompt=next_event_prompt,
+                replacements_per_sample=[
+                    {"next_instruction": text, "event_type": event_type, "event_mode": mode}
+                    for text in next_event_langs
+                ],
+            )
+            qwen_long_event_groups.append({
+                "mode": mode,
+                "qwen_prev_inputs": qwen_prev_inputs,
+                "qwen_prev_fixed_positions": qwen_prev_fixed_positions,
+                "qwen_next_inputs": qwen_next_inputs,
+                "qwen_next_fixed_positions": qwen_next_fixed_positions,
+                "qwen_prev_target_inputs": _build_inputs(prev_target_images, instructions),
+                "qwen_next_target_inputs": _build_inputs(next_target_images, instructions),
+                "has_rnd_prev": has_prev,
+                "has_rnd_next": has_next,
+            })
+        batch["qwen_long_event_groups"] = qwen_long_event_groups
+        t_long_event = time.perf_counter() if timing else None
+
+        has_half_event = [bool(sample.get("has_half_event", False)) for sample in batch_list]
+        batch["has_half_event"] = has_half_event
+        if any(has_half_event):
+            half_images = [
+                sample.get("half_event_images", []) if has_half_event[i] else batch_images[i]
+                for i, sample in enumerate(batch_list)
+            ]
+            half_directions = [sample.get("half_event_direction", "opposite") for sample in batch_list]
+            half_prompt = half_event_prompt or (
+                "The current task is: {instruction}. Given the current observation, "
+                "predict what the observation should look like in the {half_direction} half of this episode."
+            )
+            batch["qwen_half_event_inputs"], batch["qwen_half_event_fixed_positions"] = _build_fixed_layout_inputs(
+                batch_images,
+                instructions,
+                prompt=half_prompt,
+                replacements_per_sample=[{"half_direction": d or "opposite"} for d in half_directions],
+            )
+            batch["qwen_half_event_target_inputs"] = _build_inputs(half_images, instructions)
+        else:
+            batch["qwen_half_event_inputs"] = None
+            batch["qwen_half_event_fixed_positions"] = None
+            batch["qwen_half_event_target_inputs"] = None
+    t_half_event = time.perf_counter() if timing else None
+
     for key in all_image_keys:
         batch.pop(key, None)
 
+    if timing:
+        t_end = time.perf_counter()
+        qwen_collate_fn._timing_count += 1
+        logger.info(
+            "[collate_timing] "
+            f"batch={len(batch_list)} default_collate_s={t_default_collate - t0:.4f} "
+            f"resize_current_s={t_current_images - t_default_collate:.4f} "
+            f"qwen_current_s={t_qwen_current - t_current_images:.4f} "
+            f"qwen_future_s={(t_qwen_future - t_qwen_current) if t_qwen_future else 0.0:.4f} "
+            f"long_event_s={(t_long_event - t_qwen_future) if use_fixed_layout else 0.0:.4f} "
+            f"half_event_s={(t_half_event - t_long_event) if use_fixed_layout else 0.0:.4f} "
+            f"total_s={t_end - t0:.4f}"
+        )
     return batch
-
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -431,7 +820,10 @@ def _make_single_dataset(
 def make_dataset(config: TrainConfig, policy_config: PreTrainedConfig, seed: int = 42):
     future_offset = getattr(config.data, "future_offset", None)
     data_mix = getattr(config.data, "data_mix", None)
+    dataset_type = getattr(config.data, "dataset_type", "lerobot")
+    use_multiimage_event = dataset_type == "lerobot_multiimage_event"
     video_backend = _resolve_video_backend()
+    image_transforms = None
 
     if data_mix is not None:
         data_root_dir = getattr(config.data, "data_root_dir", None)
@@ -450,14 +842,34 @@ def make_dataset(config: TrainConfig, policy_config: PreTrainedConfig, seed: int
         data_mixture = []
         for dataset_name, weight in mixture_spec:
             data_path = f"{data_root_dir}/{dataset_name}"
-            ds = _make_single_dataset(
-                data_path,
-                policy_config,
-                future_offset,
-                config.data.tolerance_s,
-                video_backend=video_backend,
-                image_transforms=image_transforms,
-            )
+            if use_multiimage_event:
+                ds_meta = LeRobotDatasetMetadata(root=data_path, revision=None)
+                delta_timestamps = _resolve_delta_timestamps(policy_config, ds_meta)
+                if future_offset is not None:
+                    if delta_timestamps is None:
+                        delta_timestamps = {}
+                    for cam_key in ds_meta.camera_keys:
+                        ts_list = list(delta_timestamps.get(cam_key, [0.0]))
+                        ts_list.append(int(future_offset) / ds_meta.fps)
+                        delta_timestamps[cam_key] = ts_list
+                ds = LeRobotMultiImageEventDataset(
+                    root=data_path,
+                    episodes=None,
+                    delta_timestamps=delta_timestamps,
+                    image_transforms=None,
+                    revision=None,
+                    video_backend=video_backend,
+                    tolerance_s=config.data.tolerance_s,
+                )
+            else:
+                ds = _make_single_dataset(
+                    data_path,
+                    policy_config,
+                    future_offset,
+                    config.data.tolerance_s,
+                    video_backend=video_backend,
+                    image_transforms=image_transforms,
+                )
             data_mixture.append((ds, weight))
 
         balance = getattr(config.data, "balance_dataset_weights", True)
@@ -468,14 +880,34 @@ def make_dataset(config: TrainConfig, policy_config: PreTrainedConfig, seed: int
             seed=seed,
         )
     else:
-        dataset = _make_single_dataset(
-            config.data.data_path,
-            policy_config,
-            future_offset,
-            config.data.tolerance_s,
-            video_backend=video_backend,
-            image_transforms=_make_image_transforms(),
-        )
+        if use_multiimage_event:
+            ds_meta = LeRobotDatasetMetadata(root=config.data.data_path, revision=None)
+            delta_timestamps = _resolve_delta_timestamps(policy_config, ds_meta)
+            if future_offset is not None:
+                if delta_timestamps is None:
+                    delta_timestamps = {}
+                for cam_key in ds_meta.camera_keys:
+                    ts_list = list(delta_timestamps.get(cam_key, [0.0]))
+                    ts_list.append(int(future_offset) / ds_meta.fps)
+                    delta_timestamps[cam_key] = ts_list
+            dataset = LeRobotMultiImageEventDataset(
+                root=config.data.data_path,
+                episodes=None,
+                delta_timestamps=delta_timestamps,
+                image_transforms=None,
+                revision=None,
+                video_backend=video_backend,
+                tolerance_s=config.data.tolerance_s,
+            )
+        else:
+            dataset = _make_single_dataset(
+                config.data.data_path,
+                policy_config,
+                future_offset,
+                config.data.tolerance_s,
+                video_backend=video_backend,
+                image_transforms=_make_image_transforms(),
+            )
 
     return dataset
 
@@ -777,22 +1209,31 @@ def update_policy(
         else nullcontext()
     )
 
-    t_fwd_vla.start()
-    with torch.profiler.record_function("forward_vla"), autocast_context:
-        output = policy(batch)
-        vla_loss = output["loss"]
-    fwd_vla_s = t_fwd_vla.stop()
+    vla_batches = batch if isinstance(batch, list) else [batch]
+    vla_outputs = []
+    for micro_idx, vla_batch in enumerate(vla_batches):
+        is_last_vla = micro_idx == len(vla_batches) - 1
+        with torch.profiler.record_function("forward_vla"):
+            with autocast_context:
+                micro_output = policy(vla_batch)
+                vla_outputs.append(micro_output)
+                vla_loss = micro_output["loss"] / len(vla_batches)
 
-    t_bwd_vla.start()
-    with torch.profiler.record_function("backward_vla"):
-        # WARNING: We need to check if this is ok
-        if vlm_batch is not None:
-            policy.set_is_last_backward(False)
-        vla_loss.backward()
-    bwd_vla_s = t_bwd_vla.stop()
+        with torch.profiler.record_function("backward_vla"):
+            if hasattr(policy, "set_is_last_backward"):
+                # WARNING: We need to check if this is ok
+                policy.set_is_last_backward(is_last_vla and vlm_batch is None)
+            vla_loss.backward()
 
-    fwd_vlm_s = 0.0
-    bwd_vlm_s = 0.0
+    if not vla_outputs:
+        raise RuntimeError("update_policy received no VLA batches")
+
+    output = dict(vla_outputs[-1])
+    for key in vla_outputs[-1].keys():
+        values = [out[key] for out in vla_outputs if key in out and torch.is_tensor(out[key]) and out[key].ndim == 0]
+        if len(values) == len(vla_outputs):
+            output[key] = torch.stack([value.detach() for value in values]).mean()
+
     if vlm_batch is not None:
         t_fwd_vlm.start()
         with torch.profiler.record_function("forward_vlm"), autocast_context:
@@ -845,6 +1286,17 @@ def update_policy(
         train_metrics.nfp_mse_loss = output["nfp_mse_loss_0"].item()
     if "nfp_cosine_loss_0" in output and "nfp_cosine_loss" in train_metrics.metrics:
         train_metrics.nfp_cosine_loss = output["nfp_cosine_loss_0"].item()
+    if "short_future_loss_0" in output and "short_future_loss" in train_metrics.metrics:
+        train_metrics.short_future_loss = output["short_future_loss_0"].item()
+    if "prev_event_loss" in output and "prev_event_loss" in train_metrics.metrics:
+        train_metrics.prev_event_loss = output["prev_event_loss"].item()
+    if "next_event_loss" in output and "next_event_loss" in train_metrics.metrics:
+        train_metrics.next_event_loss = output["next_event_loss"].item()
+    if "long_event_loss" in train_metrics.metrics:
+        prev_loss = output.get("prev_event_loss")
+        next_loss = output.get("next_event_loss")
+        if prev_loss is not None and next_loss is not None:
+            train_metrics.long_event_loss = (prev_loss + next_loss).item()
     if "vlm_loss" in output and "vlm_loss" in train_metrics.metrics:
         train_metrics.vlm_loss = output["vlm_loss"].item() * vlm_loss_scale
 
@@ -856,10 +1308,10 @@ def main(config: TrainConfig, seed: int):
 
     policy_config = PreTrainedConfig.from_train_config(config)
 
-    dist.init_process_group(backend=get_platform().dist_backend())
     local_rank = int(os.environ["LOCAL_RANK"])
     get_platform().set_device(local_rank)
     device = get_platform().device(local_rank)
+    dist.init_process_group(backend=get_platform().dist_backend())
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     is_main_process = rank == 0
@@ -918,10 +1370,10 @@ def main(config: TrainConfig, seed: int):
         num_episodes = 1
     else:
         dataset = make_dataset(config, policy_config, seed=seed)
-        dist.barrier()
+        dist.barrier(device_ids=[local_rank])
 
         policy = make_policy(policy_config, dataset.meta)
-        dist.barrier()
+        dist.barrier(device_ids=[local_rank])
 
         dataset_stats = (
             dataset.merged_stats
@@ -952,6 +1404,10 @@ def main(config: TrainConfig, seed: int):
             processor=policy.vlm.processor,
             prompt_template=policy.vlm._prompt_template,
             image_feature_keys=list(policy.image_features.keys()),
+            fixed_layout_config=getattr(config.data, "fixed_layout", None),
+            prev_event_prompt=getattr(config.data, "prev_event_prompt", None),
+            next_event_prompt=getattr(config.data, "next_event_prompt", None),
+            half_event_prompt=getattr(config.data, "half_event_prompt", None),
         )
 
         dataloader = StatefulDataLoader(
@@ -1017,7 +1473,7 @@ def main(config: TrainConfig, seed: int):
     # Setup optimizer and scheduler (applies freeze config internally)
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(policy, config)
 
-    dist.barrier()
+    dist.barrier(device_ids=[local_rank])
 
     step = 0
     resume_from = config.system.checkpoint.resume_from
@@ -1045,6 +1501,10 @@ def main(config: TrainConfig, seed: int):
         "action_loss": AverageMeter("act_loss", ":.3f"),
         "nfp_mse_loss": AverageMeter("nfp_mse", ":.4f"),
         "nfp_cosine_loss": AverageMeter("nfp_cos", ":.4f"),
+        "short_future_loss": AverageMeter("short_q", ":.3f"),
+        "prev_event_loss": AverageMeter("prev_q", ":.3f"),
+        "next_event_loss": AverageMeter("next_q", ":.3f"),
+        "long_event_loss": AverageMeter("long_q", ":.3f"),
         "grad_norm": AverageMeter("grdn", ":.3f"),
         "lr": AverageMeter("lr", ":0.1e"),
         "update_s": AverageMeter("updt_s", ":.3f"),
@@ -1075,6 +1535,34 @@ def main(config: TrainConfig, seed: int):
         if isinstance(v, Mapping):
             return {k: _to_device(val, dev) for k, val in v.items()}
         return v
+
+    def _next_vla_batch():
+        """Fetch the next VLA batch, skipping batches that qwen_collate_fn
+        has flagged as fully corrupted (all-None). Returns the new dl_iter
+        too, since StopIteration bumps the epoch and rebuilds it.
+        """
+        nonlocal dl_iter, epoch
+        max_skip_in_a_row = 64
+        skipped = 0
+        while True:
+            try:
+                return next(dl_iter)
+            except StopIteration:
+                epoch += 1
+                if sampler is not None:
+                    sampler.set_epoch(epoch)
+                if isinstance(dataset, LeRobotMixtureDataset):
+                    dataset.set_epoch(epoch)
+                dl_iter = iter(dataloader)
+                continue
+            except SkipBatch as e:
+                skipped += 1
+                logger.warning(f"[train] skipping bad batch ({skipped}): {e}")
+                if skipped >= max_skip_in_a_row:
+                    raise RuntimeError(
+                        f"giving up after {skipped} consecutive bad batches"
+                    ) from e
+                continue
 
     # --- Torch profiler ---
     # Produces per-rank Chrome trace JSON at <output_dir>/profiler_traces/rank_<N>/
@@ -1132,23 +1620,22 @@ def main(config: TrainConfig, seed: int):
     # _gc_callback._start_time = 0
     # gc.callbacks.append(_gc_callback)
 
+    vla_gradient_accumulation_steps = max(1, int(getattr(config.system, "vla_gradient_accumulation_steps", 1)))
+
+    vla_gradient_accumulation_steps = max(1, int(getattr(config.system, "vla_gradient_accumulation_steps", 1)))
+
     for _ in range(step, config.system.train_steps):
         # --- Dataloader phase ---
         with torch.profiler.record_function("dataloader_vla"):
             data_timer = CudaTimer()
             data_timer.start()
-            try:
-                batch = next(dl_iter)
-            except StopIteration:
-                epoch += 1
-                if sampler is not None:
-                    sampler.set_epoch(epoch)
-                if isinstance(dataset, LeRobotMixtureDataset):
-                    dataset.set_epoch(epoch)
-                dl_iter = iter(dataloader)
-                batch = next(dl_iter)
-            if isinstance(batch, dict):
-                batch = {k: _to_device(v, device) for k, v in batch.items()}
+            vla_micro_batches = []
+            for _micro_idx in range(vla_gradient_accumulation_steps):
+                micro_batch = _next_vla_batch()
+                if isinstance(micro_batch, dict):
+                    micro_batch = {k: _to_device(v, device) for k, v in micro_batch.items()}
+                vla_micro_batches.append(micro_batch)
+            batch = vla_micro_batches[0] if vla_gradient_accumulation_steps == 1 else vla_micro_batches
 
         with torch.profiler.record_function("dataloader_vlm"):
             if vlm_dl_iter is not None:
@@ -1186,7 +1673,10 @@ def main(config: TrainConfig, seed: int):
 
         with torch.profiler.record_function("preprocessor"):
             if preprocessor is not None:
-                batch = preprocessor(batch)
+                if isinstance(batch, list):
+                    batch = [preprocessor(micro_batch) for micro_batch in batch]
+                else:
+                    batch = preprocessor(batch)
             train_tracker.dataloading_s = data_timer.stop()
 
         # Debug: log tensor shapes and GPU memory for memory profiling
@@ -1249,8 +1739,8 @@ def main(config: TrainConfig, seed: int):
                             f"[VLM_sample {i}] data_path={data_path} file={file} seqlen={seqlen}"
                         )
 
-            _log_vla_batch(batch)
-            _log_vlm_batch(vlm_batch)
+            _log_vla_batch( batch[0] if isinstance(batch, list) else batch)
+            _log_vlm_batch( vlm_batch[0] if isinstance(vlm_batch, list) else vlm_batch)
 
         with torch.profiler.record_function("update_policy"):
             train_tracker = update_policy(
@@ -1284,7 +1774,7 @@ def main(config: TrainConfig, seed: int):
             config.system.checkpoint.save_checkpoint
             and step % config.system.checkpoint.save_freq == 0
         ):
-            dist.barrier()
+            dist.barrier(device_ids=[local_rank])
 
             # get_model_state_dict and get_optimizer_state_dict are collectives — all ranks must call
             options = StateDictOptions(full_state_dict=True, cpu_offload=True)
@@ -1314,12 +1804,12 @@ def main(config: TrainConfig, seed: int):
                 )
                 update_last_checkpoint(checkpoint_dir)
 
-            dist.barrier()
+            dist.barrier(device_ids=[local_rank])
 
     if is_main_process:
         logger.info("Training completed")
 
-    dist.barrier()
+    dist.barrier(device_ids=[local_rank])
     dist.destroy_process_group()
 
 

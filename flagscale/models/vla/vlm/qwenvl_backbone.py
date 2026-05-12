@@ -310,6 +310,7 @@ class Qwen3VLBackbone(QwenVLBackbone):
         messages = self._build_messages(images, instructions)
 
         # Preparation for inference
+        # enable_thinking=False to match starVLA's no-thinking VLA prompt.
         batch_inputs = self.processor.apply_chat_template(
             messages,
             tokenize=True,
@@ -317,6 +318,7 @@ class Qwen3VLBackbone(QwenVLBackbone):
             add_generation_prompt=True,
             return_dict=True,
             return_tensors="pt",
+            enable_thinking=False,
         )
 
         logger.info(
@@ -391,8 +393,12 @@ class Qwen3_5VLBackbone(QwenVLBackbone):
 
         messages = self._build_messages(images, instructions)
 
+        # enable_thinking=False to keep inference distribution aligned with the
+        # training-side collate in train_qwen3_5_gr00t.py.
         texts = [
-            self.processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True)
+            self.processor.apply_chat_template(
+                m, tokenize=False, add_generation_prompt=True, enable_thinking=False
+            )
             for m in messages
         ]
 

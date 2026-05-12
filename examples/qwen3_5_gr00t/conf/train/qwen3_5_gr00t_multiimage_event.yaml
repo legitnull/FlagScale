@@ -1,28 +1,19 @@
 system:
-  batch_size: 4
-  train_steps: 150000
-  log_freq: 1
+  batch_size: 2
+  vla_gradient_accumulation_steps: 2
+  train_steps: 46500
+  log_freq: 10
   grad_clip_norm: 1.0
   use_amp: true
   shuffle: true
-  num_workers: 16
-  vlm_loss_scale: 0.1
+  num_workers: 4
+  vlm_loss_scale: 0.4
 
   checkpoint:
     output_directory: ${experiment.exp_dir}
     save_checkpoint: true
-    save_freq: 10000
-
-  activation_checkpoint:
-    # mode: none
-    mode: full
-    # selective_ac_option: "op"
-    # preserve_rng_state: true
-    # memory_budget: 0.5
-    # checkpoint_patterns:
-    #   - "vlm\\.model\\.model\\.language_model\\.layers\\.\\d+"
-    #   - "action_model\\._head\\.model\\.transformer_blocks\\.\\d+"
-
+    save_freq: 5000
+    # resume_from: ./outputs/qwen3_5_gr00t_train/checkpoints/000100
 model:
   model_name: qwen3_5_gr00t
   vlm:
@@ -57,9 +48,6 @@ model:
       output_dim: 1024
       positional_embeddings: None
 
-  # chunked_ce_tokens: 128
-  chunked_ce_tokens: 0
-
   # NFP (Next Frame Prediction) head
   nfp:
     vl_hidden_dim: 2560
@@ -69,9 +57,9 @@ model:
     vlm_feature_layer: -1
     nfp_loss_mse_weight: 0.1
     nfp_loss_cosine_weight: 1.0
-    short_future_loss_weight: 1.0
-    prev_event_loss_weight: 0.5
-    next_event_loss_weight: 0.5
+    short_future_loss_weight: 0.1
+    prev_event_loss_weight: 0.25
+    next_event_loss_weight: 0.25
     half_event_loss_weight: 0.0
     # Must match data.fixed_layout.num_query_tokens when fixed-layout WM is enabled.
     num_query_tokens: 256
@@ -91,13 +79,13 @@ model:
 
   optimizer:
     name: AdamW
-    lr: 2.5e-5
+    lr: 5.0e-05
     betas: [0.9, 0.95]
     eps: 1.0e-08
     weight_decay: 1.0e-08
     param_groups:
       vlm:
-        lr: 1.0e-05
+        lr: 1.5e-05
       action_model:
         lr: 1.0e-04
     scheduler:
@@ -116,7 +104,7 @@ model:
       - "vlm\\.model\\.model\\.visual\\..*"
 
 data:
-  dataset_type: lerobot
+  dataset_type: lerobot_multiimage_event
   # Future frame offset (in steps) for NFP training.
   # Set to null to disable NFP future image fetching.
   future_offset: 1
@@ -135,7 +123,7 @@ data:
   next_event_prompt: "The next {event_type} event will be: {next_instruction}. Given the current observation, predict the image latent distribution of that next event."
   half_event_prompt: "The current task is: {instruction}. Given the current observation, predict what the observation should look like in the {half_direction} half of this episode."
   fixed_layout:
-    enabled: false
+    enabled: true
     num_query_tokens: 256
     learnable_query_tokens: true
     allow_unsupervised_query_grad: false
@@ -143,8 +131,8 @@ data:
     instruction_max_tokens: 192
 
   # Multi-dataset mixture (set data_mix to use, or leave null for single dataset via data_path)
-  data_mix: ego1
-  data_root_dir: /share/project/hotel/lerobot30_multiimage_data_1fps
+  data_mix: ego1_multiimage
+  data_root_dir: /share/project/hotel/lerobot30_multiimage_data_1fps/event
   balance_dataset_weights: true
   preprocessor:
     name: policy_preprocessor
@@ -181,8 +169,8 @@ data:
     dataset_use: all   # original; honeydata excluded below to test OOM hypothesis (max_img=12 outliers)
     # dataset_use: llavav15_lrv,activitynetqa_0_30_s,nextqa_0_30_s,perceptiontest_0_30_s,youtube_0_30_s,academic_1_2_m,activitynetqa_1_2_m,nextqa_1_2_m,youtube_1_2_m,academic_2_3_m,activitynetqa_2_3_m,nextqa_2_3_m,youtube_2_3_m,academic_30_60_s,activitynetqa_30_60_s,nextqa_30_60_s,perceptiontest_30_60_s,youtube_30_60_s,academic_0_30_s,academic_mc_0_30_s,nextqa_mc_0_30_s,youtube_mc_0_30_s,academic_mc_1_2_m,nextqa_mc_1_2_m,youtube_mc_1_2_m,academic_mc_2_3_m,nextqa_mc_2_3_m,youtube_mc_2_3_m,academic_mc_30_60_s,nextqa_mc_30_60_s,youtube_mc_30_60_s,cambrian_s_3m,cambrian_10m,vsi_590k,vsi_590k_spatial,llava_hound
     eval_dataset: null
-    per_device_batch_size: 4
-    model_max_length: 4608
+    per_device_batch_size: 1
+    model_max_length: 1024
     max_pixels: 307200
     min_pixels: 784
     video_max_frame_pixels: 65536

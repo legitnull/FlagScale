@@ -41,6 +41,9 @@ from flagscale.models.vla.utils import get_vlm_config
 from flagscale.platforms.platform_manager import get_platform
 from flagscale.train.utils.chunked_cross_entropy import chunked_cross_entropy_loss
 
+VISION_START_TOKEN_ID = 248053
+VISION_END_TOKEN_ID = 248054
+
 
 class Qwen35Gr00t(TrainablePolicy):
     """
@@ -96,6 +99,34 @@ class Qwen35Gr00t(TrainablePolicy):
                         self.nfp_head_num,
                     )
 
+            self.use_input_query_tokens = bool(
+                getattr(self.nfp_config, "learnable_query_tokens", True)
+            )
+            self.num_input_query_tokens = int(
+                getattr(self.nfp_config, "num_query_tokens", 32)
+            )
+            self.allow_unsupervised_query_grad = bool(
+                getattr(self.nfp_config, "allow_unsupervised_query_grad", False)
+            )
+            self.long_event_head = GatedMLP(
+                hidden_dim=self.nfp_config.vl_hidden_dim,
+                expand_ratio=self.nfp_config.expand_ratio,
+                depth=self.nfp_config.depth,
+                dropout=self.nfp_config.dropout,
+            )
+            if self.use_input_query_tokens:
+                self.short_query_embeddings = nn.Parameter(
+                    torch.empty(self.num_input_query_tokens, self.nfp_config.vl_hidden_dim)
+                )
+                self.long_query_embeddings = nn.Parameter(
+                    torch.empty(self.num_input_query_tokens, self.nfp_config.vl_hidden_dim)
+                )
+                nn.init.normal_(self.short_query_embeddings, mean=0.0, std=0.02)
+                nn.init.normal_(self.long_query_embeddings, mean=0.0, std=0.02)
+            else:
+                self.short_query_embeddings = None
+                self.long_query_embeddings = None
+
         # self.action_model = build_action_model(
         #     config.action_model.type,
         #     config=config.action_model,
@@ -109,6 +140,256 @@ class Qwen35Gr00t(TrainablePolicy):
             self.input_features = config.input_features
         if config.output_features:
             self.output_features = config.output_features
+
+    def _zero_loss(self, device: torch.device) -> torch.Tensor:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    def _move_inputs_to_device(self, inputs: dict | None, device: torch.device) -> dict | None:
+        if inputs is None:
+            return None
+        return {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+
+    def _reshape_image_embeddings(self, image_embeddings: torch.Tensor, batch_size: int) -> torch.Tensor:
+        return image_embeddings.reshape(batch_size, -1, image_embeddings.shape[-1])
+
+    def _build_target_image_embeddings(self, qwen_target_inputs: dict | None) -> torch.Tensor | None:
+        if qwen_target_inputs is None:
+            return None
+        with torch.no_grad():
+            image_embeddings = self.vlm.build_image_embeddings(**qwen_target_inputs)
+        if image_embeddings is None:
+            return None
+        return image_embeddings.detach()
+
+    @staticmethod
+    def _positions_to_list(positions, batch_size: int) -> list[int]:
+        if torch.is_tensor(positions):
+            if positions.dim() == 0:
+                return [int(positions.item())] * batch_size
+            if positions.numel() != batch_size:
+                raise ValueError(f"Expected {batch_size} positions, got {positions.numel()}.")
+            return [int(v) for v in positions.detach().cpu().view(-1).tolist()]
+        if isinstance(positions, (list, tuple)):
+            if len(positions) != batch_size:
+                raise ValueError(f"Expected {batch_size} positions, got {len(positions)}.")
+            return [int(v) for v in positions]
+        return [int(positions)] * batch_size
+
+    def _make_partially_detached_query_embeddings(
+        self,
+        query_embeddings: torch.Tensor,
+        supervised_token_count: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        query_embeddings = query_embeddings.to(device=device, dtype=dtype)
+        if self.allow_unsupervised_query_grad:
+            return query_embeddings
+        supervised_token_count = max(0, min(int(supervised_token_count), query_embeddings.shape[0]))
+        unsupervised_count = query_embeddings.shape[0] - supervised_token_count
+        if unsupervised_count <= 0:
+            return query_embeddings
+        if supervised_token_count == 0:
+            return query_embeddings.detach()
+        return torch.cat([
+            query_embeddings[:unsupervised_count].detach(),
+            query_embeddings[unsupervised_count:],
+        ], dim=0)
+
+    def _insert_query_embeddings(
+        self,
+        inputs_embeds: torch.Tensor,
+        input_ids: torch.Tensor,
+        fixed_positions: dict,
+        query_supervision: dict | None = None,
+    ) -> torch.Tensor:
+        if not self.use_input_query_tokens:
+            return inputs_embeds
+        if self.short_query_embeddings is None or self.long_query_embeddings is None:
+            return inputs_embeds
+
+        query_supervision = query_supervision or {}
+        batch_size = input_ids.shape[0]
+        short_starts = self._positions_to_list(fixed_positions["short_query_start"], batch_size)
+        short_ends = self._positions_to_list(fixed_positions["short_query_end"], batch_size)
+        long_starts = self._positions_to_list(fixed_positions["long_query_start"], batch_size)
+        long_ends = self._positions_to_list(fixed_positions["long_query_end"], batch_size)
+        short_embeds = self._make_partially_detached_query_embeddings(
+            self.short_query_embeddings,
+            query_supervision.get("short", 0),
+            dtype=inputs_embeds.dtype,
+            device=inputs_embeds.device,
+        )
+        long_embeds = self._make_partially_detached_query_embeddings(
+            self.long_query_embeddings,
+            query_supervision.get("long", 0),
+            dtype=inputs_embeds.dtype,
+            device=inputs_embeds.device,
+        )
+
+        patched_rows = []
+        for batch_idx in range(batch_size):
+            row_embeds = inputs_embeds[batch_idx]
+            replacements = []
+            for name, start, end, query_embeds in (
+                ("short", short_starts[batch_idx], short_ends[batch_idx] + 1, short_embeds),
+                ("long", long_starts[batch_idx], long_ends[batch_idx] + 1, long_embeds),
+            ):
+                query_ids = input_ids[batch_idx, start:end]
+                patch_mask = (query_ids != VISION_START_TOKEN_ID) & (query_ids != VISION_END_TOKEN_ID)
+                if patch_mask.sum().item() != self.num_input_query_tokens:
+                    raise ValueError(
+                        f"Sample {batch_idx} {name} query patch-token count does not match "
+                        f"num_query_tokens={self.num_input_query_tokens}."
+                    )
+                replacements.append((start, end, patch_mask, query_embeds))
+
+            segments = []
+            cursor = 0
+            for start, end, patch_mask, query_embeds in sorted(replacements, key=lambda item: item[0]):
+                segments.append(row_embeds[cursor:start])
+                original_segment = row_embeds[start:end]
+                patch_indices = patch_mask.cumsum(dim=0).sub(1).clamp_min(0)
+                query_values = query_embeds[patch_indices]
+                patched_segment = torch.where(patch_mask[:, None], query_values, original_segment)
+                segments.append(patched_segment)
+                cursor = end
+            segments.append(row_embeds[cursor:])
+            patched_rows.append(torch.cat(segments, dim=0))
+        return torch.stack(patched_rows, dim=0)
+
+    def _run_fixed_layout_hidden(
+        self,
+        qwen_inputs: dict,
+        fixed_positions: dict,
+        feature_layer_idx: int,
+        query_supervision: dict | None = None,
+    ) -> torch.Tensor:
+        hf_model = self.vlm.model.model
+        input_ids = qwen_inputs["input_ids"]
+        attention_mask = qwen_inputs.get("attention_mask", None)
+        mm_token_type_ids = qwen_inputs.get("mm_token_type_ids", None)
+        inputs_embeds = hf_model.get_input_embeddings()(input_ids).clone()
+
+        if qwen_inputs.get("pixel_values", None) is not None:
+            image_outputs = hf_model.get_image_features(
+                qwen_inputs["pixel_values"], qwen_inputs.get("image_grid_thw", None), return_dict=True
+            )
+            image_embeds = image_outputs.pooler_output
+            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            image_mask, _ = hf_model.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+        if qwen_inputs.get("pixel_values_videos", None) is not None:
+            video_outputs = hf_model.get_video_features(
+                qwen_inputs["pixel_values_videos"], qwen_inputs.get("video_grid_thw", None), return_dict=True
+            )
+            video_embeds = video_outputs.pooler_output
+            video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            _, video_mask = hf_model.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+
+        inputs_embeds = self._insert_query_embeddings(
+            inputs_embeds, input_ids, fixed_positions, query_supervision=query_supervision
+        )
+        position_ids = hf_model.compute_3d_position_ids(
+            input_ids=input_ids,
+            image_grid_thw=qwen_inputs.get("image_grid_thw", None),
+            video_grid_thw=qwen_inputs.get("video_grid_thw", None),
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=None,
+            mm_token_type_ids=mm_token_type_ids,
+        )
+        outputs = hf_model.language_model(
+            input_ids=None,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        return outputs.hidden_states[1:][feature_layer_idx]
+
+    def _slice_query_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        qwen_inputs: dict,
+        fixed_positions: dict,
+        start_key: str,
+        end_key: str,
+    ) -> torch.Tensor:
+        starts = self._positions_to_list(fixed_positions[start_key], hidden_states.shape[0])
+        ends = self._positions_to_list(fixed_positions[end_key], hidden_states.shape[0])
+        selected = []
+        for batch_idx in range(hidden_states.shape[0]):
+            query_hidden = hidden_states[batch_idx, starts[batch_idx]:ends[batch_idx] + 1, :]
+            query_ids = qwen_inputs["input_ids"][batch_idx, starts[batch_idx]:ends[batch_idx] + 1]
+            query_attention = qwen_inputs["attention_mask"][batch_idx, starts[batch_idx]:ends[batch_idx] + 1].to(torch.bool)
+            query_patch_mask = (
+                (query_ids != VISION_START_TOKEN_ID)
+                & (query_ids != VISION_END_TOKEN_ID)
+                & query_attention
+            )
+            patch_hidden = query_hidden[query_patch_mask]
+            if patch_hidden.shape[0] != self.num_input_query_tokens:
+                raise ValueError(
+                    f"Sample {batch_idx} has {patch_hidden.shape[0]} query patch tokens, "
+                    f"expected num_query_tokens={self.num_input_query_tokens}."
+                )
+            selected.append(patch_hidden)
+        return torch.stack(selected, dim=0)
+
+    def _slice_supervised_tail(
+        self,
+        predictions: torch.Tensor,
+        target_token_count: int,
+        name: str,
+    ) -> torch.Tensor:
+        if target_token_count <= 0:
+            raise ValueError(f"{name} target_token_count must be positive, got {target_token_count}.")
+        if predictions.shape[1] < target_token_count:
+            raise ValueError(
+                f"{name} has {predictions.shape[1]} query outputs, but target requires {target_token_count} patch tokens."
+            )
+        return predictions[:, -target_token_count:, :]
+
+    def _masked_nfp_loss(
+        self,
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+        sample_mask: list[bool] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if sample_mask is None:
+            return self._nfp_loss(
+                predictions.reshape(-1, predictions.shape[-1]),
+                targets.reshape(-1, targets.shape[-1]),
+            )
+        if not any(bool(flag) for flag in sample_mask):
+            zero = (predictions.sum() + targets.sum()) * 0.0
+            return zero, zero
+        mask = torch.as_tensor(sample_mask, device=predictions.device, dtype=torch.bool)
+        return self._nfp_loss(
+            predictions[mask].reshape(-1, predictions.shape[-1]),
+            targets[mask].reshape(-1, targets.shape[-1]),
+        )
+
+    def _auxiliary_zero_connected_loss(self, device: torch.device) -> torch.Tensor:
+        zero = torch.zeros((), device=device)
+        for module in (getattr(self, "nfp_head", None), getattr(self, "long_event_head", None)):
+            if module is None:
+                continue
+            for param in module.parameters():
+                if param.requires_grad and param.numel() > 0:
+                    zero = zero + param.reshape(-1)[0] * 0.0
+        for param in (getattr(self, "short_query_embeddings", None), getattr(self, "long_query_embeddings", None)):
+            if param is not None and param.requires_grad and param.numel() > 0:
+                zero = zero + param.reshape(-1)[0] * 0.0
+        return zero
 
     def _nfp_loss(self, nfp_outputs: torch.Tensor, nfp_targets: torch.Tensor):
         """Compute MSE and cosine embedding loss for NFP head."""
@@ -132,7 +413,205 @@ class Qwen35Gr00t(TrainablePolicy):
             return {"vlm_loss": self.forward_vlm(batch)}
         return self.forward_vla(batch)
 
+    def _forward_vla_fixed_layout(self, batch: dict) -> dict[str, torch.Tensor]:
+        if self.nfp_config is None:
+            raise ValueError("Fixed-layout WM training requires model.nfp to be configured.")
+        device = next(self.parameters()).device
+        qwen_inputs = self._move_inputs_to_device(batch["qwen_inputs"], device)
+        qwen_future_inputs = self._move_inputs_to_device(batch.get("qwen_future_inputs"), device)
+        qwen_fixed_positions = batch["qwen_fixed_positions"]
+        qwen_long_event_groups = batch.get("qwen_long_event_groups", [])
+        qwen_half_event_inputs = self._move_inputs_to_device(batch.get("qwen_half_event_inputs"), device)
+        qwen_half_event_target_inputs = self._move_inputs_to_device(batch.get("qwen_half_event_target_inputs"), device)
+        qwen_half_event_fixed_positions = batch.get("qwen_half_event_fixed_positions", None)
+        has_half_event = batch.get("has_half_event", None)
+
+        feature_layer_idx = self.nfp_config.vlm_feature_layer
+        head_dtype = next(self.nfp_head.parameters()).dtype if isinstance(self.nfp_head, nn.Module) else next(self.nfp_head[0].parameters()).dtype
+        future_embeddings = self._build_target_image_embeddings(qwen_future_inputs)
+        if future_embeddings is None:
+            raise ValueError("qwen_future_inputs are required for fixed-layout short future prediction.")
+        future_targets = self._reshape_image_embeddings(
+            future_embeddings.to(dtype=head_dtype), qwen_inputs["input_ids"].shape[0]
+        )
+
+        with torch.autocast(get_platform().amp_device_type(), dtype=torch.bfloat16):
+            last_hidden = self._run_fixed_layout_hidden(
+                qwen_inputs,
+                qwen_fixed_positions,
+                feature_layer_idx,
+                query_supervision={"short": future_targets.shape[1], "long": 0},
+            )
+
+        short_features = self._slice_query_hidden(
+            last_hidden, qwen_inputs, qwen_fixed_positions, "short_query_start", "short_query_end"
+        ).to(dtype=head_dtype)
+        if isinstance(self.nfp_head, nn.ModuleList):
+            short_head = self.nfp_head[0]
+        else:
+            short_head = self.nfp_head
+        short_outputs = short_head(short_features.reshape(-1, short_features.shape[-1]))
+        short_outputs = short_outputs.reshape(short_features.shape[0], short_features.shape[1], -1)
+        short_outputs = self._slice_supervised_tail(short_outputs, future_targets.shape[1], "short future")
+        nfp_mse_loss, nfp_cosine_loss = self._nfp_loss(
+            short_outputs.reshape(-1, short_outputs.shape[-1]),
+            future_targets.reshape(-1, future_targets.shape[-1]),
+        )
+        nfp_feature = short_outputs.detach().clone()
+
+        used_long_event_head = False
+
+        def zero_connect_long_event_head() -> torch.Tensor:
+            long_features = self._slice_query_hidden(
+                last_hidden, qwen_inputs, qwen_fixed_positions, "long_query_start", "long_query_end"
+            ).to(dtype=head_dtype)
+            # Keep the event head in the distributed graph without adding a fake supervision target.
+            long_probe = long_features[:, :1, :].reshape(-1, long_features.shape[-1])
+            long_outputs = self.long_event_head(long_probe)
+            return long_outputs.sum() * 0.0
+
+        def compute_event_loss(event_inputs, event_positions, target_inputs, sample_mask, use_short_head=False):
+            nonlocal used_long_event_head
+            zero = self._zero_loss(last_hidden.device)
+            if event_inputs is None or event_positions is None or target_inputs is None:
+                return zero, zero
+            # Keep event forward counts identical across distributed ranks. Fully masked
+            # groups still use dummy targets and contribute zero loss via the mask.
+            event_inputs = self._move_inputs_to_device(event_inputs, device)
+            target_inputs = self._move_inputs_to_device(target_inputs, device)
+            target_embeddings = self._build_target_image_embeddings(target_inputs)
+            if target_embeddings is None:
+                return zero, zero
+            event_targets = self._reshape_image_embeddings(
+                target_embeddings.to(dtype=head_dtype), event_inputs["input_ids"].shape[0]
+            )
+            with torch.autocast(get_platform().amp_device_type(), dtype=torch.bfloat16):
+                event_hidden = self._run_fixed_layout_hidden(
+                    event_inputs,
+                    event_positions,
+                    feature_layer_idx,
+                    query_supervision={
+                        "short": event_targets.shape[1] if use_short_head else 0,
+                        "long": 0 if use_short_head else event_targets.shape[1],
+                    },
+                )
+            start_key = "short_query_start" if use_short_head else "long_query_start"
+            end_key = "short_query_end" if use_short_head else "long_query_end"
+            event_features = self._slice_query_hidden(
+                event_hidden, event_inputs, event_positions, start_key, end_key
+            ).to(dtype=head_dtype)
+            head = short_head if use_short_head else self.long_event_head
+            event_outputs = head(event_features.reshape(-1, event_features.shape[-1]))
+            if not use_short_head:
+                used_long_event_head = True
+            event_outputs = event_outputs.reshape(event_features.shape[0], event_features.shape[1], -1)
+            event_outputs = self._slice_supervised_tail(
+                event_outputs, event_targets.shape[1], "half event" if use_short_head else "long event"
+            )
+            return self._masked_nfp_loss(event_outputs, event_targets, sample_mask)
+
+        prev_mse = self._zero_loss(last_hidden.device)
+        prev_cos = self._zero_loss(last_hidden.device)
+        next_mse = self._zero_loss(last_hidden.device)
+        next_cos = self._zero_loss(last_hidden.device)
+        half_mse = self._zero_loss(last_hidden.device)
+        half_cos = self._zero_loss(last_hidden.device)
+        compute_prev_events = float(self.nfp_config.prev_event_loss_weight) != 0.0
+        compute_next_events = float(self.nfp_config.next_event_loss_weight) != 0.0
+        compute_half_events = float(self.nfp_config.half_event_loss_weight) != 0.0
+        long_event_records = []
+        for group in qwen_long_event_groups:
+            group_prev_mse = self._zero_loss(last_hidden.device)
+            group_prev_cos = self._zero_loss(last_hidden.device)
+            group_next_mse = self._zero_loss(last_hidden.device)
+            group_next_cos = self._zero_loss(last_hidden.device)
+            if compute_prev_events:
+                group_prev_mse, group_prev_cos = compute_event_loss(
+                    group.get("qwen_prev_inputs"),
+                    group.get("qwen_prev_fixed_positions"),
+                    group.get("qwen_prev_target_inputs"),
+                    group.get("has_rnd_prev"),
+                )
+            if compute_next_events:
+                group_next_mse, group_next_cos = compute_event_loss(
+                    group.get("qwen_next_inputs"),
+                    group.get("qwen_next_fixed_positions"),
+                    group.get("qwen_next_target_inputs"),
+                    group.get("has_rnd_next"),
+                )
+            prev_mse = prev_mse + group_prev_mse
+            prev_cos = prev_cos + group_prev_cos
+            next_mse = next_mse + group_next_mse
+            next_cos = next_cos + group_next_cos
+            long_event_records.append((group.get("mode", "event"), group_prev_mse, group_prev_cos, group_next_mse, group_next_cos))
+
+        if compute_half_events:
+            half_mse, half_cos = compute_event_loss(
+                qwen_half_event_inputs,
+                qwen_half_event_fixed_positions,
+                qwen_half_event_target_inputs,
+                has_half_event,
+                use_short_head=False,
+            )
+
+        loss_dict = {}
+        if self.use_action_policy_loss:
+            actions = batch[ACTION]
+            if isinstance(actions, list):
+                actions = torch.tensor(np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype)
+            else:
+                actions = actions.to(device=last_hidden.device, dtype=last_hidden.dtype)
+            actions_target = actions[:, -(self.future_action_window_size + 1):, :]
+            repeated_diffusion_steps = self.config.action_model.repeated_diffusion_steps
+            vlm_output = {"hidden_states": last_hidden.repeat(repeated_diffusion_steps, 1, 1)}
+            vlm_output["nfp_feature"] = nfp_feature.repeat(repeated_diffusion_steps, 1, 1)
+            action_input = {"actions": actions_target.repeat(repeated_diffusion_steps, 1, 1), "state": None}
+            output = self.action_model.forward(vlm_output, action_input)
+            action_loss = output["loss"]
+            loss = action_loss
+            loss_dict["raw_action_loss"] = action_loss
+        else:
+            loss = self._zero_loss(last_hidden.device)
+
+        short_loss = self.nfp_config.nfp_loss_mse_weight * nfp_mse_loss + self.nfp_config.nfp_loss_cosine_weight * nfp_cosine_loss
+        prev_loss = self.nfp_config.nfp_loss_mse_weight * prev_mse + self.nfp_config.nfp_loss_cosine_weight * prev_cos
+        next_loss = self.nfp_config.nfp_loss_mse_weight * next_mse + self.nfp_config.nfp_loss_cosine_weight * next_cos
+        half_loss = self.nfp_config.nfp_loss_mse_weight * half_mse + self.nfp_config.nfp_loss_cosine_weight * half_cos
+        loss = loss + self.nfp_config.short_future_loss_weight * short_loss
+        loss = loss + self.nfp_config.prev_event_loss_weight * prev_loss
+        loss = loss + self.nfp_config.next_event_loss_weight * next_loss
+        loss = loss + self.nfp_config.half_event_loss_weight * half_loss
+        if not used_long_event_head and (compute_prev_events or compute_next_events or compute_half_events):
+            loss = loss + zero_connect_long_event_head()
+        loss = loss + self._auxiliary_zero_connected_loss(last_hidden.device)
+
+        loss_dict.update({
+            "nfp_mse_loss_0": nfp_mse_loss,
+            "nfp_cosine_loss_0": nfp_cosine_loss,
+            "short_future_loss_0": short_loss,
+            "prev_nfp_mse_loss": prev_mse,
+            "prev_nfp_cosine_loss": prev_cos,
+            "next_nfp_mse_loss": next_mse,
+            "next_nfp_cosine_loss": next_cos,
+            "prev_event_loss": prev_loss,
+            "next_event_loss": next_loss,
+            "half_event_mse_loss": half_mse,
+            "half_event_cosine_loss": half_cos,
+            "half_event_loss": half_loss,
+            "action_loss": loss,
+            "loss": loss,
+        })
+        for mode, group_prev_mse, group_prev_cos, group_next_mse, group_next_cos in long_event_records:
+            loss_dict[f"{mode}_prev_nfp_mse_loss"] = group_prev_mse
+            loss_dict[f"{mode}_prev_nfp_cosine_loss"] = group_prev_cos
+            loss_dict[f"{mode}_next_nfp_mse_loss"] = group_next_mse
+            loss_dict[f"{mode}_next_nfp_cosine_loss"] = group_next_cos
+        return loss_dict
+
     def forward_vla(self, batch: list[dict] | dict) -> dict[str, torch.Tensor]:
+        if isinstance(batch, dict) and "qwen_fixed_positions" in batch:
+            return self._forward_vla_fixed_layout(batch)
+
         if isinstance(batch, list):  # wds: list of per-sample dicts
             images = [ex["image"] for ex in batch]
             instructions = [ex["lang"] for ex in batch]
@@ -305,6 +784,7 @@ class Qwen35Gr00t(TrainablePolicy):
                 loss += 0.1 * mse_loss + cosine_loss
                 loss_dict[f"nfp_mse_loss_{i}"] = mse_loss
                 loss_dict[f"nfp_cosine_loss_{i}"] = cosine_loss
+            loss = loss + self._auxiliary_zero_connected_loss(last_hidden.device)
             loss_dict["action_loss"] = loss
             result = loss_dict
             result["loss"] = loss

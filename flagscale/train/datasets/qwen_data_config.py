@@ -13,7 +13,7 @@ video_data_root = os.environ.get("VLM_VIDEO_ROOT", "/share/project/mycao/web_vid
 image_root = os.environ.get("VLM_IMAGE_ROOT", "/share/project/mycao/robobrain_v2_5_sz")
 
 HONEYDATA = {
-    "annotation_path": f"{vlm_data_root}/honey_data_rel_1071666.json",
+    "annotation_path": f"{vlm_data_root}/honey_data_rel_1071666_qwen35_tokenlen1024.json",
     "data_path": f"{image_root}/",
 }
 

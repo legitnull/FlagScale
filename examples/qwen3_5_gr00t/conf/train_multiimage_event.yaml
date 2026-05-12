@@ -1,9 +1,9 @@
 defaults:
   - _self_
-  - train: qwen3_5_gr00t
+  - train: qwen3_5_gr00t_multiimage_event
 
 experiment:
-  exp_name: 0512_wm_zero3_vlm_prefetch_noshard_visual_no_dit_fwd_ac_full_plain_ce_bsz4_cuda_timer_vlm_amp_remove_action_head_debug_gc_freeze
+  exp_name: Fs_wm_multiimage_event_two_query_24node
   seed: 42
   save_steps: 10000
   load: null
@@ -17,7 +17,7 @@ experiment:
     per_node_task: false
     no_shared_fs: false
     rdzv_backend: static
-    hostfile: /share/project/mycao/wm_exp/hostfile.2
+    hostfile: /share/project/mycao/wm_exp/hostfile.24
   cmds:
     before_start: >-
       pkill -f torchrun || true ;
@@ -36,6 +36,12 @@ experiment:
     NCCL_SOCKET_IFNAME: eth0
     NCCL_IB_HCA: mlx5_100,mlx5_101,mlx5_102,mlx5_103,mlx5_104,mlx5_105,mlx5_106,mlx5_107
     NCCL_IB_GID_INDEX: 7
+    NCCL_DEBUG: INFO
+    NCCL_DEBUG_SUBSYS: INIT,NET,GRAPH,ENV
+    TORCH_NCCL_TRACE_BUFFER_SIZE: 1048576
+    TORCH_NCCL_DUMP_ON_TIMEOUT: 1
+    TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC: 3600
+    NCCL_TIMEOUT: 3600
     LIBAV_LOG_LEVEL: 0
     AV_LOG_LEVEL: quiet
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
