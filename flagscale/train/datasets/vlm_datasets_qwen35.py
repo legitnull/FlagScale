@@ -493,6 +493,11 @@ class LazySupervisedDataset(Dataset):
                         f"Image tokens truncated: {num_image_tokens} vs {expected_tokens}, skipping sample {i}"
                     )
 
+        # Inject dataset source info for logging
+        src = self.list_data_dict[i]
+        data_dict["_vlm_data_path"] = src.get("data_path", "")
+        data_dict["_vlm_file"] = str(src.get("video", src.get("image", "")))
+
         return data_dict
 
 
@@ -588,6 +593,12 @@ class DataCollatorForQwen35:
         batch["image_grid_thw"] = grid_thw
         batch["pixel_values_videos"] = concat_videos
         batch["video_grid_thw"] = video_grid_thw
+
+        # Pass through dataset source info for logging
+        if "_vlm_data_path" in instances[0]:
+            batch["_vlm_data_path"] = [inst["_vlm_data_path"] for inst in instances]
+        if "_vlm_file" in instances[0]:
+            batch["_vlm_file"] = [inst["_vlm_file"] for inst in instances]
 
         return batch
 

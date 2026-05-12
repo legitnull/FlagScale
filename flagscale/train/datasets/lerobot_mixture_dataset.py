@@ -114,7 +114,17 @@ class LeRobotMixtureDataset(Dataset):
         for attempt in range(max_retries):
             try:
                 dataset, sample_index = self.sample_step(index)
-                return dataset[sample_index]
+                item = dataset[sample_index]
+                item["_dataset_name"] = dataset.root.name
+                # Check for None values that would crash default_collate
+                none_keys = [k for k, v in item.items() if v is None]
+                if none_keys:
+                    raise ValueError(
+                        f"None values in dataset={dataset.root.name} "
+                        f"episode={item.get('episode_index', '?')} "
+                        f"sample_index={sample_index} keys={none_keys}"
+                    )
+                return item
             except Exception as e:
                 last_exception = e
                 if attempt < max_retries - 1:

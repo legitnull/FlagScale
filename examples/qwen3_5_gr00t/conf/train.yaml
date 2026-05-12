@@ -3,7 +3,7 @@ defaults:
   - train: qwen3_5_gr00t
 
 experiment:
-  exp_name: 0510_wm_zero3_vlm_prefetch_noshard_visual_no_dit_fwd_ac_full_a800
+  exp_name: 0512_wm_zero3_vlm_prefetch_noshard_visual_no_dit_fwd_ac_none_plain_ce_bsz1_cuda_timer_vlm_amp_remove_action_head_debug_gc_freeze
   seed: 42
   save_steps: 10000
   load: null

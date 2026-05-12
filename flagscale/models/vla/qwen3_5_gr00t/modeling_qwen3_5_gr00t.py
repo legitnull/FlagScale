@@ -96,10 +96,10 @@ class Qwen35Gr00t(TrainablePolicy):
                         self.nfp_head_num,
                     )
 
-        self.action_model = build_action_model(
-            config.action_model.type,
-            config=config.action_model,
-        )
+        # self.action_model = build_action_model(
+        #     config.action_model.type,
+        #     config=config.action_model,
+        # )
 
         self.future_action_window_size = config.action_model.future_action_window_size
         self.use_state = config.action_model.use_state
@@ -237,59 +237,59 @@ class Qwen35Gr00t(TrainablePolicy):
                     .clone()
                 )
 
-        if self.use_action_policy_loss:
-            with torch.autocast(get_platform().amp_device_type(), dtype=torch.float32):
-                if isinstance(actions, list):
-                    if isinstance(actions[0], torch.Tensor):
-                        actions = torch.stack(actions).to(
-                            device=last_hidden.device, dtype=last_hidden.dtype
-                        )
-                    else:
-                        actions = torch.tensor(
-                            np.array(actions),
-                            device=last_hidden.device,
-                            dtype=last_hidden.dtype,
-                        )
-                else:
-                    actions = actions.to(device=last_hidden.device, dtype=last_hidden.dtype)
-                actions_target = actions[:, -(self.future_action_window_size + 1) :, :]
+        # if self.use_action_policy_loss:
+        #     with torch.autocast(get_platform().amp_device_type(), dtype=torch.float32):
+        #         if isinstance(actions, list):
+        #             if isinstance(actions[0], torch.Tensor):
+        #                 actions = torch.stack(actions).to(
+        #                     device=last_hidden.device, dtype=last_hidden.dtype
+        #                 )
+        #             else:
+        #                 actions = torch.tensor(
+        #                     np.array(actions),
+        #                     device=last_hidden.device,
+        #                     dtype=last_hidden.dtype,
+        #                 )
+        #         else:
+        #             actions = actions.to(device=last_hidden.device, dtype=last_hidden.dtype)
+        #         actions_target = actions[:, -(self.future_action_window_size + 1) :, :]
 
-                repeated_diffusion_steps = self.config.action_model.repeated_diffusion_steps
+        #         repeated_diffusion_steps = self.config.action_model.repeated_diffusion_steps
 
-                actions_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
-                last_hidden_repeated = last_hidden.repeat(repeated_diffusion_steps, 1, 1)
+        #         actions_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
+        #         last_hidden_repeated = last_hidden.repeat(repeated_diffusion_steps, 1, 1)
 
-                state_repeated = None
-                if state is not None:
-                    if isinstance(state, list):
-                        if isinstance(state[0], torch.Tensor):
-                            state = torch.stack(state).to(
-                                device=last_hidden.device, dtype=last_hidden.dtype
-                            )
-                        else:
-                            state = torch.tensor(
-                                np.array(state),
-                                device=last_hidden.device,
-                                dtype=last_hidden.dtype,
-                            )
-                    else:
-                        state = state.to(device=last_hidden.device, dtype=last_hidden.dtype)
-                    state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
+        #         state_repeated = None
+        #         if state is not None:
+        #             if isinstance(state, list):
+        #                 if isinstance(state[0], torch.Tensor):
+        #                     state = torch.stack(state).to(
+        #                         device=last_hidden.device, dtype=last_hidden.dtype
+        #                     )
+        #                 else:
+        #                     state = torch.tensor(
+        #                         np.array(state),
+        #                         device=last_hidden.device,
+        #                         dtype=last_hidden.dtype,
+        #                     )
+        #             else:
+        #                 state = state.to(device=last_hidden.device, dtype=last_hidden.dtype)
+        #             state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
 
-                vlm_output_repeated = {"hidden_states": last_hidden_repeated}
-                if nfp_feature is not None:
-                    if nfp_feature.ndim == 4:
-                        nfp_feature_repeated = nfp_feature.repeat(1, repeated_diffusion_steps, 1, 1)
-                    else:
-                        nfp_feature_repeated = nfp_feature.repeat(repeated_diffusion_steps, 1, 1)
-                    vlm_output_repeated["nfp_feature"] = nfp_feature_repeated
+        #         vlm_output_repeated = {"hidden_states": last_hidden_repeated}
+        #         if nfp_feature is not None:
+        #             if nfp_feature.ndim == 4:
+        #                 nfp_feature_repeated = nfp_feature.repeat(1, repeated_diffusion_steps, 1, 1)
+        #             else:
+        #                 nfp_feature_repeated = nfp_feature.repeat(repeated_diffusion_steps, 1, 1)
+        #             vlm_output_repeated["nfp_feature"] = nfp_feature_repeated
 
-                action_input = {
-                    "actions": actions_repeated,
-                    "state": state_repeated,
-                }
+        #         action_input = {
+        #             "actions": actions_repeated,
+        #             "state": state_repeated,
+        #         }
 
-                output = self.action_model.forward(vlm_output_repeated, action_input)
+        #         output = self.action_model.forward(vlm_output_repeated, action_input)
 
         # Loss composition — aligned with starVLA QwenGR00TDynamic35
         if self.nfp_config is not None:
@@ -422,7 +422,8 @@ class Qwen35Gr00t(TrainablePolicy):
         return output
 
     def fsdp_units(self):
-        return self.vlm.fsdp_units() + self.action_model.fsdp_units()
+        # return self.vlm.fsdp_units() + self.action_model.fsdp_units()
+        return self.vlm.fsdp_units()
 
     def _save_pretrained(self, save_directory: Path, state_dict=None) -> None:
         """Save Qwen35Gr00t checkpoint: VLM processor + config.json + weights.

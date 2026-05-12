@@ -2,6 +2,7 @@
 # https://github.com/huggingface/lerobot/blob/2b304eeb841ae6c371e3dd341bbbb9dd254b07cb/src/lerobot/scripts/lerobot_train.py
 
 import argparse
+import gc
 import os
 import random
 import time
@@ -694,6 +695,28 @@ def _build_pipeline_from_config(
     )
 
 
+class CudaTimer:
+    """GPU-synchronized timer using CUDA events for accurate measurement."""
+
+    def __init__(self, benchmark: bool = True):
+        self._benchmark = benchmark
+        if self._benchmark:
+            self._start = torch.cuda.Event(enable_timing=True)
+            self._end = torch.cuda.Event(enable_timing=True)
+
+    def start(self):
+        if self._benchmark:
+            self._start.record()
+
+    def stop(self) -> float:
+        """Stop timer, synchronize, and return elapsed time in seconds."""
+        if not self._benchmark:
+            return 0.0
+        self._end.record()
+        torch.cuda.synchronize()
+        return self._start.elapsed_time(self._end) / 1000.0  # ms -> s
+
+
 def has_method(cls: object, method_name: str) -> bool:
     return hasattr(cls, method_name) and callable(getattr(cls, method_name))
 
@@ -735,7 +758,15 @@ def update_policy(
     Returns:
         The updated MetricsTracker with new statistics for this step.
     """
-    start_time = time.perf_counter()
+    timer = CudaTimer()
+    timer.start()
+
+    # Per-phase timers for diagnosing spikes
+    t_fwd_vla = CudaTimer()
+    t_bwd_vla = CudaTimer()
+    t_fwd_vlm = CudaTimer()
+    t_bwd_vlm = CudaTimer()
+    t_opt = CudaTimer()
 
     with torch.profiler.record_function("optimizer_zero_grad"):
         optimizer.zero_grad()
@@ -746,24 +777,36 @@ def update_policy(
         else nullcontext()
     )
 
+    t_fwd_vla.start()
     with torch.profiler.record_function("forward_vla"), autocast_context:
         output = policy(batch)
         vla_loss = output["loss"]
+    fwd_vla_s = t_fwd_vla.stop()
 
+    t_bwd_vla.start()
     with torch.profiler.record_function("backward_vla"):
-        if vlm_batch is not None:
-            policy.set_is_last_backward(False)
+        # if vlm_batch is not None:
+        #     policy.set_is_last_backward(False)
         vla_loss.backward()
+    bwd_vla_s = t_bwd_vla.stop()
 
+    fwd_vlm_s = 0.0
+    bwd_vlm_s = 0.0
     if vlm_batch is not None:
-        with torch.profiler.record_function("forward_vlm"):
+        t_fwd_vlm.start()
+        with torch.profiler.record_function("forward_vlm"), autocast_context:
             policy.set_is_last_backward(True)
             vlm_output = policy(vlm_batch, mode="vlm")
             vlm_loss_scaled = vlm_loss_scale * vlm_output["vlm_loss"]
+        fwd_vlm_s = t_fwd_vlm.stop()
+
+        t_bwd_vlm.start()
         with torch.profiler.record_function("backward_vlm"):
             vlm_loss_scaled.backward()
+        bwd_vlm_s = t_bwd_vlm.stop()
         output["vlm_loss"] = vlm_output["vlm_loss"]
 
+    t_opt.start()
     with torch.profiler.record_function("grad_clip"):
         grad_norm = torch.nn.utils.clip_grad_norm_(
             policy.parameters(), grad_clip_norm if grad_clip_norm > 0 else float("inf")
@@ -780,6 +823,7 @@ def update_policy(
     # Update internal buffers if policy has update method
     if has_method(policy, "update"):
         policy.update()
+    opt_s = t_opt.stop()
 
     train_metrics.grad_norm = (
         grad_norm.full_tensor().item() if hasattr(grad_norm, "full_tensor") else grad_norm.item()
@@ -788,7 +832,12 @@ def update_policy(
         (g["lr"] for g in optimizer.param_groups if g.get("name") == "vlm"),
         optimizer.param_groups[0]["lr"],
     )
-    train_metrics.update_s = time.perf_counter() - start_time
+    train_metrics.update_s = timer.stop()
+    train_metrics.fwd_vla_s = fwd_vla_s
+    train_metrics.bwd_vla_s = bwd_vla_s
+    train_metrics.fwd_vlm_s = fwd_vlm_s
+    train_metrics.bwd_vlm_s = bwd_vlm_s
+    train_metrics.opt_s = opt_s
     if "raw_action_loss" in output and "action_loss" in train_metrics.metrics:
         train_metrics.action_loss = output["raw_action_loss"].item()
     if "nfp_mse_loss_0" in output and "nfp_mse_loss" in train_metrics.metrics:
@@ -999,6 +1048,11 @@ def main(config: TrainConfig, seed: int):
         "lr": AverageMeter("lr", ":0.1e"),
         "update_s": AverageMeter("updt_s", ":.3f"),
         "dataloading_s": AverageMeter("data_s", ":.3f"),
+        "fwd_vla_s": AverageMeter("fwd_vla", ":.3f"),
+        "bwd_vla_s": AverageMeter("bwd_vla", ":.3f"),
+        "fwd_vlm_s": AverageMeter("fwd_vlm", ":.3f"),
+        "bwd_vlm_s": AverageMeter("bwd_vlm", ":.3f"),
+        "opt_s": AverageMeter("opt_s", ":.3f"),
     }
     if vlm_dl_iter is not None:
         train_metrics["vlm_loss"] = AverageMeter("vlm_loss", ":.3f")
@@ -1057,10 +1111,31 @@ def main(config: TrainConfig, seed: int):
         profiler.start()
         logger.info(f"[Profiler] Rank {rank}: enabled. Traces -> {profiler_output_dir}")
 
+    # Freeze all objects created during setup (model, optimizer, buffers) so GC
+    # never scans them. Without this, GC triggers random 20s+ stalls when Python
+    # destructor → cudaFree coincides with NCCL collectives. Short-lived training
+    # objects are still collected normally via refcount + gen-0 GC.
+    gc.collect()
+    gc.freeze()
+
+    # Log any automatic GC that still triggers during training. Since we only
+    # froze setup objects, gen-0 collections can still fire on new allocations.
+    # This lets us detect if GC is causing stalls we can't otherwise see.
+    def _gc_callback(phase, info):
+        if phase == "start":
+            _gc_callback._start_time = time.perf_counter()
+        elif phase == "stop":
+            elapsed = time.perf_counter() - _gc_callback._start_time
+            logger.info(f"[GC] auto collection gen={info['generation']} "
+                        f"collected={info.get('collected', '?')} elapsed={elapsed:.4f}s")
+    _gc_callback._start_time = 0
+    gc.callbacks.append(_gc_callback)
+
     for _ in range(step, config.system.train_steps):
         # --- Dataloader phase ---
         with torch.profiler.record_function("dataloader_vla"):
-            start_time = time.perf_counter()
+            data_timer = CudaTimer()
+            data_timer.start()
             try:
                 batch = next(dl_iter)
             except StopIteration:
@@ -1111,12 +1186,12 @@ def main(config: TrainConfig, seed: int):
         with torch.profiler.record_function("preprocessor"):
             if preprocessor is not None:
                 batch = preprocessor(batch)
-            train_tracker.dataloading_s = time.perf_counter() - start_time
+            train_tracker.dataloading_s = data_timer.stop()
 
         # Debug: log tensor shapes and GPU memory for memory profiling
         if step % config.system.log_freq == 0:
 
-            def _log_batch_shapes(name, b):
+            def _log_vla_batch(b):
                 if b is None:
                     return
                 parts = []
@@ -1132,10 +1207,49 @@ def main(config: TrainConfig, seed: int):
                         if nested:
                             parts.append(f"{k}: {{{', '.join(nested)}}}")
                 if parts:
-                    logger.info(f"[{name}] rank={rank} " + ", ".join(parts))
+                    logger.info(f"[VLA_batch] rank={rank} " + ", ".join(parts))
+                # Per-sample dataset info
+                ds_names = b.get("_dataset_name", None)
+                ep_idx = b.get("episode_index", None)
+                sample_idx = b.get("index", None)
+                if ds_names is not None:
+                    ep_list = ep_idx.tolist() if isinstance(ep_idx, torch.Tensor) else ep_idx
+                    idx_list = sample_idx.tolist() if isinstance(sample_idx, torch.Tensor) else sample_idx
+                    for i, name in enumerate(ds_names):
+                        logger.info(
+                            f"[VLA_sample {i}] dataset={name} episode={ep_list[i]} index={idx_list[i]}"
+                        )
 
-            _log_batch_shapes("VLA_batch", batch)
-            _log_batch_shapes("VLM_batch", vlm_batch)
+            def _log_vlm_batch(b):
+                if b is None:
+                    return
+                parts = []
+                for k, v in b.items():
+                    if isinstance(v, torch.Tensor):
+                        parts.append(f"{k}: {list(v.shape)}")
+                    elif isinstance(v, Mapping):
+                        # Log nested Mapping (e.g. qwen_inputs BatchEncoding)
+                        nested = []
+                        for nk, nv in v.items():
+                            if isinstance(nv, torch.Tensor):
+                                nested.append(f"{nk}: {list(nv.shape)}")
+                        if nested:
+                            parts.append(f"{k}: {{{', '.join(nested)}}}")
+                if parts:
+                    logger.info(f"[VLM_batch] rank={rank} " + ", ".join(parts))
+                # Per-sample dataset info
+                vlm_data_paths = b.get("_vlm_data_path", None)
+                vlm_files = b.get("_vlm_file", None)
+                if vlm_data_paths is not None and vlm_files is not None:
+                    input_ids = b.get("input_ids", None)
+                    for i, (data_path, file) in enumerate(zip(vlm_data_paths, vlm_files)):
+                        seqlen = input_ids[i].shape[0] if input_ids is not None else "?"
+                        logger.info(
+                            f"[VLM_sample {i}] data_path={data_path} file={file} seqlen={seqlen}"
+                        )
+
+            _log_vla_batch(batch)
+            _log_vlm_batch(vlm_batch)
 
         with torch.profiler.record_function("update_policy"):
             train_tracker = update_policy(

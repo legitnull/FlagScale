@@ -14,8 +14,8 @@ system:
     save_freq: 10000
 
   activation_checkpoint:
-    # mode: none
-    mode: full
+    mode: none
+    # mode: full
     # selective_ac_option: "op"
     # preserve_rng_state: true
     # memory_budget: 0.5
