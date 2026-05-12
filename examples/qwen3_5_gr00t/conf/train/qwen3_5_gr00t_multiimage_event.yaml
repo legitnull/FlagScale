@@ -1,18 +1,18 @@
 system:
   batch_size: 2
   vla_gradient_accumulation_steps: 2
-  train_steps: 279000
+  train_steps: 46500
   log_freq: 10
   grad_clip_norm: 1.0
   use_amp: true
   shuffle: true
-  num_workers: 16
+  num_workers: 4
   vlm_loss_scale: 0.4
 
   checkpoint:
     output_directory: ${experiment.exp_dir}
     save_checkpoint: true
-    save_freq: 10000
+    save_freq: 5000
     # resume_from: ./outputs/qwen3_5_gr00t_train/checkpoints/000100
 model:
   model_name: qwen3_5_gr00t
@@ -79,13 +79,13 @@ model:
 
   optimizer:
     name: AdamW
-    lr: 2.5e-5
+    lr: 5.0e-05
     betas: [0.9, 0.95]
     eps: 1.0e-08
     weight_decay: 1.0e-08
     param_groups:
       vlm:
-        lr: 1.0e-05
+        lr: 1.5e-05
       action_model:
         lr: 1.0e-04
     scheduler:
@@ -170,7 +170,7 @@ data:
     # dataset_use: llavav15_lrv,activitynetqa_0_30_s,nextqa_0_30_s,perceptiontest_0_30_s,youtube_0_30_s,academic_1_2_m,activitynetqa_1_2_m,nextqa_1_2_m,youtube_1_2_m,academic_2_3_m,activitynetqa_2_3_m,nextqa_2_3_m,youtube_2_3_m,academic_30_60_s,activitynetqa_30_60_s,nextqa_30_60_s,perceptiontest_30_60_s,youtube_30_60_s,academic_0_30_s,academic_mc_0_30_s,nextqa_mc_0_30_s,youtube_mc_0_30_s,academic_mc_1_2_m,nextqa_mc_1_2_m,youtube_mc_1_2_m,academic_mc_2_3_m,nextqa_mc_2_3_m,youtube_mc_2_3_m,academic_mc_30_60_s,nextqa_mc_30_60_s,youtube_mc_30_60_s,cambrian_s_3m,cambrian_10m,vsi_590k,vsi_590k_spatial,llava_hound
     eval_dataset: null
     per_device_batch_size: 1
-    model_max_length: 4608
+    model_max_length: 1024
     max_pixels: 307200
     min_pixels: 784
     video_max_frame_pixels: 65536
