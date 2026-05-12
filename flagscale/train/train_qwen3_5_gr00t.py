@@ -785,8 +785,9 @@ def update_policy(
 
     t_bwd_vla.start()
     with torch.profiler.record_function("backward_vla"):
-        # if vlm_batch is not None:
-        #     policy.set_is_last_backward(False)
+        # WARNING: We need to check if this is ok
+        if vlm_batch is not None:
+            policy.set_is_last_backward(False)
         vla_loss.backward()
     bwd_vla_s = t_bwd_vla.stop()
 
@@ -1121,15 +1122,15 @@ def main(config: TrainConfig, seed: int):
     # Log any automatic GC that still triggers during training. Since we only
     # froze setup objects, gen-0 collections can still fire on new allocations.
     # This lets us detect if GC is causing stalls we can't otherwise see.
-    def _gc_callback(phase, info):
-        if phase == "start":
-            _gc_callback._start_time = time.perf_counter()
-        elif phase == "stop":
-            elapsed = time.perf_counter() - _gc_callback._start_time
-            logger.info(f"[GC] auto collection gen={info['generation']} "
-                        f"collected={info.get('collected', '?')} elapsed={elapsed:.4f}s")
-    _gc_callback._start_time = 0
-    gc.callbacks.append(_gc_callback)
+    # def _gc_callback(phase, info):
+    #     if phase == "start":
+    #         _gc_callback._start_time = time.perf_counter()
+    #     elif phase == "stop":
+    #         elapsed = time.perf_counter() - _gc_callback._start_time
+    #         logger.info(f"[GC] auto collection gen={info['generation']} "
+    #                     f"collected={info.get('collected', '?')} elapsed={elapsed:.4f}s")
+    # _gc_callback._start_time = 0
+    # gc.callbacks.append(_gc_callback)
 
     for _ in range(step, config.system.train_steps):
         # --- Dataloader phase ---
