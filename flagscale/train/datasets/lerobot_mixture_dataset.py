@@ -117,13 +117,13 @@ class LeRobotMixtureDataset(Dataset):
                 item = dataset[sample_index]
                 item["_dataset_name"] = dataset.root.name
                 # Check for None values that would crash default_collate
-                none_keys = [k for k, v in item.items() if v is None]
-                if none_keys:
-                    raise ValueError(
-                        f"None values in dataset={dataset.root.name} "
-                        f"episode={item.get('episode_index', '?')} "
-                        f"sample_index={sample_index} keys={none_keys}"
-                    )
+                # none_keys = [k for k, v in item.items() if v is None]
+                # if none_keys:
+                #     raise ValueError(
+                #         f"None values in dataset={dataset.root.name} "
+                #         f"episode={item.get('episode_index', '?')} "
+                #         f"sample_index={sample_index} keys={none_keys}"
+                #     )
                 return item
             except Exception as e:
                 last_exception = e

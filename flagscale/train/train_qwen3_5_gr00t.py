@@ -1275,11 +1275,11 @@ def update_policy(
         optimizer.param_groups[0]["lr"],
     )
     train_metrics.update_s = timer.stop()
-    train_metrics.fwd_vla_s = fwd_vla_s
-    train_metrics.bwd_vla_s = bwd_vla_s
-    train_metrics.fwd_vlm_s = fwd_vlm_s
-    train_metrics.bwd_vlm_s = bwd_vlm_s
-    train_metrics.opt_s = opt_s
+    # train_metrics.fwd_vla_s = fwd_vla_s
+    # train_metrics.bwd_vla_s = bwd_vla_s
+    # train_metrics.fwd_vlm_s = fwd_vlm_s
+    # train_metrics.bwd_vlm_s = bwd_vlm_s
+    # train_metrics.opt_s = opt_s
     if "raw_action_loss" in output and "action_loss" in train_metrics.metrics:
         train_metrics.action_loss = output["raw_action_loss"].item()
     if "nfp_mse_loss_0" in output and "nfp_mse_loss" in train_metrics.metrics:
