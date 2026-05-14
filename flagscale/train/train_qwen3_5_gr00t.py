@@ -1274,7 +1274,8 @@ def update_policy(
         (g["lr"] for g in optimizer.param_groups if g.get("name") == "vlm"),
         optimizer.param_groups[0]["lr"],
     )
-    train_metrics.update_s = timer.stop()
+    update_s = timer.stop()
+    train_metrics.update_s = update_s
     # train_metrics.fwd_vla_s = fwd_vla_s
     # train_metrics.bwd_vla_s = bwd_vla_s
     # train_metrics.fwd_vlm_s = fwd_vlm_s
@@ -1299,6 +1300,18 @@ def update_policy(
             train_metrics.long_event_loss = (prev_loss + next_loss).item()
     if "vlm_loss" in output and "vlm_loss" in train_metrics.metrics:
         train_metrics.vlm_loss = output["vlm_loss"].item() * vlm_loss_scale
+
+    # VLM throughput: samples/sec for this GPU
+    if vlm_batch is not None and "vlm_bsz" in train_metrics.metrics:
+        vlm_bsz = vlm_batch["input_ids"].shape[0]
+        train_metrics.vlm_bsz = vlm_bsz
+        train_metrics.vlm_tput = vlm_bsz / update_s if update_s > 0 else 0.0
+
+    # VLA throughput: total samples across micro-batches / update_s
+    vla_batches = batch if isinstance(batch, list) else [batch]
+    vla_total_bsz = sum(mb["action"].shape[0] for mb in vla_batches)
+    train_metrics.vla_bsz = vla_total_bsz
+    train_metrics.vla_tput = vla_total_bsz / update_s if update_s > 0 else 0.0
 
     return train_metrics
 
@@ -1514,9 +1527,13 @@ def main(config: TrainConfig, seed: int):
         "fwd_vlm_s": AverageMeter("fwd_vlm", ":.3f"),
         "bwd_vlm_s": AverageMeter("bwd_vlm", ":.3f"),
         "opt_s": AverageMeter("opt_s", ":.3f"),
+        "vla_bsz": AverageMeter("vla_bsz", ":.1f"),
+        "vla_tput": AverageMeter("vla_tput", ":.2f"),
     }
     if vlm_dl_iter is not None:
         train_metrics["vlm_loss"] = AverageMeter("vlm_loss", ":.3f")
+        train_metrics["vlm_bsz"] = AverageMeter("vlm_bsz", ":.1f")
+        train_metrics["vlm_tput"] = AverageMeter("vlm_tput", ":.2f")
 
     train_tracker = MetricsTracker(
         config.system.batch_size,
@@ -1622,8 +1639,6 @@ def main(config: TrainConfig, seed: int):
 
     vla_gradient_accumulation_steps = max(1, int(getattr(config.system, "vla_gradient_accumulation_steps", 1)))
 
-    vla_gradient_accumulation_steps = max(1, int(getattr(config.system, "vla_gradient_accumulation_steps", 1)))
-
     for _ in range(step, config.system.train_steps):
         # --- Dataloader phase ---
         with torch.profiler.record_function("dataloader_vla"):
@@ -1654,23 +1669,6 @@ def main(config: TrainConfig, seed: int):
                     for k, v in vlm_batch.items()
                 }
 
-        # Pad VLM batch to model_max_length unconditionally for memory profiling.
-        # Remove this block after profiling.
-        # if vlm_batch is not None:
-        #     max_seq = 6000
-        #     cur_seq = vlm_batch["input_ids"].shape[-1]
-        #     if cur_seq < max_seq:
-        #         pad_len = max_seq - cur_seq
-        #         bs = vlm_batch["input_ids"].shape[0]
-        #         dev = vlm_batch["input_ids"].device
-        #         for key in ("input_ids", "labels", "mm_token_type_ids"):
-        #             if key in vlm_batch:
-        #                 pad = torch.zeros(bs, pad_len, dtype=vlm_batch[key].dtype, device=dev)
-        #                 vlm_batch[key] = torch.cat([vlm_batch[key], pad], dim=1)
-        #         if "attention_mask" in vlm_batch:
-        #             pad = torch.zeros(bs, pad_len, dtype=vlm_batch["attention_mask"].dtype, device=dev)
-        #             vlm_batch["attention_mask"] = torch.cat([vlm_batch["attention_mask"], pad], dim=1)
-
         with torch.profiler.record_function("preprocessor"):
             if preprocessor is not None:
                 if isinstance(batch, list):
@@ -1679,7 +1677,6 @@ def main(config: TrainConfig, seed: int):
                     batch = preprocessor(batch)
             train_tracker.dataloading_s = data_timer.stop()
 
-        # Debug: log tensor shapes and GPU memory for memory profiling
         if step % config.system.log_freq == 0:
 
             def _log_vla_batch(b):
@@ -1739,8 +1736,8 @@ def main(config: TrainConfig, seed: int):
                             f"[VLM_sample {i}] data_path={data_path} file={file} seqlen={seqlen}"
                         )
 
-            _log_vla_batch( batch[0] if isinstance(batch, list) else batch)
-            _log_vlm_batch( vlm_batch[0] if isinstance(vlm_batch, list) else vlm_batch)
+            # _log_vla_batch( batch[0] if isinstance(batch, list) else batch)
+            # _log_vlm_batch( vlm_batch[0] if isinstance(vlm_batch, list) else vlm_batch)
 
         with torch.profiler.record_function("update_policy"):
             train_tracker = update_policy(

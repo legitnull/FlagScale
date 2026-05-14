@@ -1,8 +1,8 @@
 system:
-  batch_size: 8
+  batch_size: 16
   vla_gradient_accumulation_steps: 2
   train_steps: 46500
-  log_freq: 10
+  log_freq: 1
   grad_clip_norm: 1.0
   use_amp: true
   shuffle: true
@@ -16,14 +16,23 @@ system:
     # resume_from: ./outputs/qwen3_5_gr00t_train/checkpoints/000100
 
   activation_checkpoint:
+    # ==== setup1: none ====
     # mode: none
+
+    # ==== setup2: full ====
     mode: full
-    # selective_ac_option: "op"
+
+    # ==== setup3: selective 2 ====
+    # mode: selective
+    # selective_ac_option: "2"
+
+    # ==== setup4: selective linear attn ====
+    # mode: full
+    # checkpoint_patterns:
+    #   - "vlm\\.model\\.model\\.language_model\\.layers\\.(0|1|2|4|5|6|8|9|10|12|13|14|16|17|18|20|21|22|24|25|26|28|29|30)$"
+
     # preserve_rng_state: true
     # memory_budget: 0.5
-    # checkpoint_patterns:
-    #   - "vlm\\.model\\.model\\.language_model\\.layers\\.\\d+"
-    #   - "action_model\\._head\\.model\\.transformer_blocks\\.\\d+"
 
 model:
   model_name: qwen3_5_gr00t
@@ -183,7 +192,7 @@ data:
     dataset_use: all   # original; honeydata excluded below to test OOM hypothesis (max_img=12 outliers)
     # dataset_use: llavav15_lrv,activitynetqa_0_30_s,nextqa_0_30_s,perceptiontest_0_30_s,youtube_0_30_s,academic_1_2_m,activitynetqa_1_2_m,nextqa_1_2_m,youtube_1_2_m,academic_2_3_m,activitynetqa_2_3_m,nextqa_2_3_m,youtube_2_3_m,academic_30_60_s,activitynetqa_30_60_s,nextqa_30_60_s,perceptiontest_30_60_s,youtube_30_60_s,academic_0_30_s,academic_mc_0_30_s,nextqa_mc_0_30_s,youtube_mc_0_30_s,academic_mc_1_2_m,nextqa_mc_1_2_m,youtube_mc_1_2_m,academic_mc_2_3_m,nextqa_mc_2_3_m,youtube_mc_2_3_m,academic_mc_30_60_s,nextqa_mc_30_60_s,youtube_mc_30_60_s,cambrian_s_3m,cambrian_10m,vsi_590k,vsi_590k_spatial,llava_hound
     eval_dataset: null
-    per_device_batch_size: 4
+    per_device_batch_size: 8
     model_max_length: 1024
     max_pixels: 307200
     min_pixels: 784

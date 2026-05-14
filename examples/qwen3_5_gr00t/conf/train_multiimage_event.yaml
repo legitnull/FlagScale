@@ -3,7 +3,7 @@ defaults:
   - train: qwen3_5_gr00t_multiimage_event
 
 experiment:
-  exp_name: 0512_new_baseline_bs4_ac_full
+  exp_name: 0514_multiimage_event_bs8_ac_full_linear_attn_chunked_ce128_2nodes
   seed: 42
   save_steps: 10000
   load: null
@@ -17,11 +17,13 @@ experiment:
     per_node_task: false
     no_shared_fs: false
     rdzv_backend: static
+    # hostfile: /share/project/fengyupu/github/FlagScale/hostfile.2
     # hostfile: /share/project/mycao/wm_exp/hostfile.24
   cmds:
     before_start: >-
       pkill -f torchrun || true ;
       pkill -f "flagscale/train" || true ;
+      pkill -f "/share/project/zhangqq/envs_conda/flagscale-robo/bin/python" || true ;
       ulimit -n 1048576 ;
       export PATH=/share/project/zhangqq/envs_conda/flagscale-robo/bin:$PATH ;
       export CONDA_PREFIX=/share/project/zhangqq/envs_conda/flagscale-robo
