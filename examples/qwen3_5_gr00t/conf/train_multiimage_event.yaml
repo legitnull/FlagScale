@@ -3,7 +3,7 @@ defaults:
   - train: qwen3_5_gr00t_multiimage_event
 
 experiment:
-  exp_name: 0514_multiimage_event_bs8_ac_full_linear_attn_chunked_ce128_2nodes
+  exp_name: 0514_multiimage_event_bs8_ac_full_baseline_walltimer_1node
   seed: 42
   save_steps: 10000
   load: null

@@ -1127,28 +1127,6 @@ def _build_pipeline_from_config(
     )
 
 
-class CudaTimer:
-    """GPU-synchronized timer using CUDA events for accurate measurement."""
-
-    def __init__(self, benchmark: bool = True):
-        self._benchmark = benchmark
-        if self._benchmark:
-            self._start = torch.cuda.Event(enable_timing=True)
-            self._end = torch.cuda.Event(enable_timing=True)
-
-    def start(self):
-        if self._benchmark:
-            self._start.record()
-
-    def stop(self) -> float:
-        """Stop timer, synchronize, and return elapsed time in seconds."""
-        if not self._benchmark:
-            return 0.0
-        self._end.record()
-        torch.cuda.synchronize()
-        return self._start.elapsed_time(self._end) / 1000.0  # ms -> s
-
-
 def has_method(cls: object, method_name: str) -> bool:
     return hasattr(cls, method_name) and callable(getattr(cls, method_name))
 
@@ -1190,16 +1168,6 @@ def update_policy(
     Returns:
         The updated MetricsTracker with new statistics for this step.
     """
-    timer = CudaTimer()
-    timer.start()
-
-    # Per-phase timers for diagnosing spikes
-    t_fwd_vla = CudaTimer()
-    t_bwd_vla = CudaTimer()
-    t_fwd_vlm = CudaTimer()
-    t_bwd_vlm = CudaTimer()
-    t_opt = CudaTimer()
-
     with torch.profiler.record_function("optimizer_zero_grad"):
         optimizer.zero_grad()
 
@@ -1235,20 +1203,15 @@ def update_policy(
             output[key] = torch.stack([value.detach() for value in values]).mean()
 
     if vlm_batch is not None:
-        t_fwd_vlm.start()
         with torch.profiler.record_function("forward_vlm"), autocast_context:
             policy.set_is_last_backward(True)
             vlm_output = policy(vlm_batch, mode="vlm")
             vlm_loss_scaled = vlm_loss_scale * vlm_output["vlm_loss"]
-        fwd_vlm_s = t_fwd_vlm.stop()
 
-        t_bwd_vlm.start()
         with torch.profiler.record_function("backward_vlm"):
             vlm_loss_scaled.backward()
-        bwd_vlm_s = t_bwd_vlm.stop()
         output["vlm_loss"] = vlm_output["vlm_loss"]
 
-    t_opt.start()
     with torch.profiler.record_function("grad_clip"):
         grad_norm = torch.nn.utils.clip_grad_norm_(
             policy.parameters(), grad_clip_norm if grad_clip_norm > 0 else float("inf")
@@ -1265,7 +1228,6 @@ def update_policy(
     # Update internal buffers if policy has update method
     if has_method(policy, "update"):
         policy.update()
-    opt_s = t_opt.stop()
 
     train_metrics.grad_norm = (
         grad_norm.full_tensor().item() if hasattr(grad_norm, "full_tensor") else grad_norm.item()
@@ -1274,13 +1236,6 @@ def update_policy(
         (g["lr"] for g in optimizer.param_groups if g.get("name") == "vlm"),
         optimizer.param_groups[0]["lr"],
     )
-    update_s = timer.stop()
-    train_metrics.update_s = update_s
-    # train_metrics.fwd_vla_s = fwd_vla_s
-    # train_metrics.bwd_vla_s = bwd_vla_s
-    # train_metrics.fwd_vlm_s = fwd_vlm_s
-    # train_metrics.bwd_vlm_s = bwd_vlm_s
-    # train_metrics.opt_s = opt_s
     if "raw_action_loss" in output and "action_loss" in train_metrics.metrics:
         train_metrics.action_loss = output["raw_action_loss"].item()
     if "nfp_mse_loss_0" in output and "nfp_mse_loss" in train_metrics.metrics:
@@ -1301,17 +1256,13 @@ def update_policy(
     if "vlm_loss" in output and "vlm_loss" in train_metrics.metrics:
         train_metrics.vlm_loss = output["vlm_loss"].item() * vlm_loss_scale
 
-    # VLM throughput: samples/sec for this GPU
     if vlm_batch is not None and "vlm_bsz" in train_metrics.metrics:
         vlm_bsz = vlm_batch["input_ids"].shape[0]
         train_metrics.vlm_bsz = vlm_bsz
-        train_metrics.vlm_tput = vlm_bsz / update_s if update_s > 0 else 0.0
 
-    # VLA throughput: total samples across micro-batches / update_s
     vla_batches = batch if isinstance(batch, list) else [batch]
     vla_total_bsz = sum(mb["action"].shape[0] for mb in vla_batches)
     train_metrics.vla_bsz = vla_total_bsz
-    train_metrics.vla_tput = vla_total_bsz / update_s if update_s > 0 else 0.0
 
     return train_metrics
 
@@ -1522,18 +1473,11 @@ def main(config: TrainConfig, seed: int):
         "lr": AverageMeter("lr", ":0.1e"),
         "update_s": AverageMeter("updt_s", ":.3f"),
         "dataloading_s": AverageMeter("data_s", ":.3f"),
-        "fwd_vla_s": AverageMeter("fwd_vla", ":.3f"),
-        "bwd_vla_s": AverageMeter("bwd_vla", ":.3f"),
-        "fwd_vlm_s": AverageMeter("fwd_vlm", ":.3f"),
-        "bwd_vlm_s": AverageMeter("bwd_vlm", ":.3f"),
-        "opt_s": AverageMeter("opt_s", ":.3f"),
         "vla_bsz": AverageMeter("vla_bsz", ":.1f"),
-        "vla_tput": AverageMeter("vla_tput", ":.2f"),
     }
     if vlm_dl_iter is not None:
         train_metrics["vlm_loss"] = AverageMeter("vlm_loss", ":.3f")
         train_metrics["vlm_bsz"] = AverageMeter("vlm_bsz", ":.1f")
-        train_metrics["vlm_tput"] = AverageMeter("vlm_tput", ":.2f")
 
     train_tracker = MetricsTracker(
         config.system.batch_size,
@@ -1583,7 +1527,7 @@ def main(config: TrainConfig, seed: int):
 
     # --- Torch profiler ---
     # Produces per-rank Chrome trace JSON at <output_dir>/profiler_traces/rank_<N>/
-    profiler_enabled = False
+    profiler_enabled = False #True
     profiler = None
     profiler_stop_step = 12  # wait(5) + warmup(2) + active(5)
 
@@ -1642,8 +1586,7 @@ def main(config: TrainConfig, seed: int):
     for _ in range(step, config.system.train_steps):
         # --- Dataloader phase ---
         with torch.profiler.record_function("dataloader_vla"):
-            data_timer = CudaTimer()
-            data_timer.start()
+            data_start = time.perf_counter()
             vla_micro_batches = []
             for _micro_idx in range(vla_gradient_accumulation_steps):
                 micro_batch = _next_vla_batch()
@@ -1675,7 +1618,7 @@ def main(config: TrainConfig, seed: int):
                     batch = [preprocessor(micro_batch) for micro_batch in batch]
                 else:
                     batch = preprocessor(batch)
-            train_tracker.dataloading_s = data_timer.stop()
+            train_tracker.dataloading_s = time.perf_counter() - data_start
 
         if step % config.system.log_freq == 0:
 
@@ -1740,6 +1683,7 @@ def main(config: TrainConfig, seed: int):
             # _log_vlm_batch( vlm_batch[0] if isinstance(vlm_batch, list) else vlm_batch)
 
         with torch.profiler.record_function("update_policy"):
+            update_start = time.perf_counter()
             train_tracker = update_policy(
                 train_tracker,
                 policy,
@@ -1751,6 +1695,7 @@ def main(config: TrainConfig, seed: int):
                 vlm_batch=vlm_batch,
                 vlm_loss_scale=getattr(config.system, "vlm_loss_scale", 0.1),
             )
+            train_tracker.update_s = time.perf_counter() - update_start
 
         step += 1
         train_tracker.step()
@@ -1764,7 +1709,13 @@ def main(config: TrainConfig, seed: int):
                 profiler = None
 
         if step % config.system.log_freq == 0:
-            logger.info(f"step: {step} {format_train_tracker_step(train_tracker)}")
+            avg_step_s = train_tracker.metrics["update_s"].avg + train_tracker.metrics["dataloading_s"].avg
+            vla_tput = train_tracker.metrics["vla_bsz"].avg / avg_step_s
+            tput_msg = f" vla_tput:{vla_tput:.1f}samples/s/gpu"
+            if "vlm_bsz" in train_tracker.metrics and train_tracker.metrics["vlm_bsz"].count > 0:
+                vlm_tput = train_tracker.metrics["vlm_bsz"].avg / avg_step_s
+                tput_msg += f" vlm_tput:{vlm_tput:.1f}samples/s/gpu"
+            logger.info(f"step: {step} {format_train_tracker_step(train_tracker)}{tput_msg}")
             train_tracker.reset_averages()
 
         if (
