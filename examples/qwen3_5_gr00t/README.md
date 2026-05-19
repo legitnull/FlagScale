@@ -109,7 +109,7 @@ The VLM loss is scaled by `system.vlm_loss_scale` (default `0.1`).
 
 ```sh
 cd FlagScale/
-flagscale train qwen3_5_gr00t -c ./examples/qwen3_5_gr00t/conf/train.yaml
+flagscale train qwen3_5_gr00t -c ./examples/qwen3_5_gr00t/conf/train_multiimage_event.yaml
 ```
 
 ### Stop Training

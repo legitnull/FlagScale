@@ -741,7 +741,8 @@ def apply_fsdp2(policy, device_mesh):
     lang_layers = list(policy.vlm.model.model.language_model.layers)
     for i in range(len(lang_layers) - 1):
         lang_layers[i].set_modules_to_forward_prefetch([lang_layers[i + 1]])
-        lang_layers[i].set_modules_to_backward_prefetch([lang_layers[i + 1]])
+    for i in range(1, len(lang_layers)):
+        lang_layers[i].set_modules_to_backward_prefetch([lang_layers[i - 1]])
 
     # vis_blocks = list(policy.vlm.model.model.visual.blocks)
     # for i in range(len(vis_blocks) - 1):
