@@ -1,24 +1,27 @@
 engine:
   # Model variant: "pi0" or "pi0.5"
   model_variant: "pi0.5"
-  model: /workspace/models/lerobot/pi05_base
+  model: /workspace/models/lerobot/pi05_pick_bottle
   tokenizer: /workspace/models/google/paligemma-3b-pt-224
   # TODO: (yupu) Use the stat safetensors
-  stat_path: /workspace/datasets/lerobot/aloha_mobile_cabinet/meta/stats.json
+  stat_path: /workspace/models/lerobot/pi05_pick_bottle/stats.json
   device: "cuda"
+  # Model dtype: "float32" or "bfloat16"
+  dtype: "bfloat16"
   # By default, Pi0.5 uses quantiles for state and action normalization, if false, it uses mean and std instead
-  use_quantiles: false
+  use_quantiles: true
+  # Enable torch.compile for faster inference (default: false)
+  compile: false
+  # Compile mode: "default", "reduce-overhead", "max-autotune" (default: "default")
+  compile_mode: "max-autotune"
+  # Enable TF32 matmul precision (default: false)
+  tf32: false
 
 generate:
   images:
-    observation.images.cam_high: /path/to/cam_high_image.jpg
-    observation.images.cam_left_wrist: /path/to/cam_left_wrist_image.jpg
-    observation.images.cam_right_wrist: /path/to/cam_right_wrist_image.jpg
-  state_path: /path/to/state_file.pt
-  task_path: /path/to/task_file.txt
-  # Optional rename_map to map input keys to policy expected keys
-  # Check the features key in your dataset's meta/info.json file to determine the correct mapping
-  rename_map:
-    observation.images.cam_high: observation.images.base_0_rgb
-    observation.images.cam_left_wrist: observation.images.left_wrist_0_rgb
-    observation.images.cam_right_wrist: observation.images.right_wrist_0_rgb
+    observation.images.base_0_rgb: /share/project/fengyupu/github/fs5/inference_inputs/pick_bottle/zeros_224.png
+    observation.images.left_wrist_0_rgb: /share/project/fengyupu/github/fs5/inference_inputs/pick_bottle/img.png
+    observation.images.right_wrist_0_rgb: /share/project/fengyupu/github/fs5/inference_inputs/pick_bottle/zeros_224.png
+  state_path: /share/project/fengyupu/github/fs5/inference_inputs/pick_bottle/state.pt
+  task_path: /share/project/fengyupu/github/fs5/inference_inputs/pick_bottle/task.txt
+  rename_map: {}

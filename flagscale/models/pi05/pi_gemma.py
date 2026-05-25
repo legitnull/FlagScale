@@ -322,6 +322,14 @@ class PaliGemmaModelWithPiGemma(PaliGemmaModel):
         super().__init__(config)
         self.language_model = PiGemmaModel(config.text_config)
 
+    def get_image_features(self, pixel_values):
+        """Override to remove the / hidden_size**0.5 scaling that stock HuggingFace adds.
+        The openpi source model does not apply this scaling."""
+        image_outputs = self.vision_tower(pixel_values)
+        selected_image_feature = image_outputs.last_hidden_state
+        image_features = self.multi_modal_projector(selected_image_feature)
+        return image_features
+
 
 class PaliGemmaForConditionalGenerationWithPiGemma(PaliGemmaForConditionalGeneration):
     """PaliGemmaForConditionalGeneration using PiGemma decoder for the language model."""

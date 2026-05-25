@@ -1,15 +1,15 @@
 defaults:
   - _self_
-  - inference: pi0_5
+  - inference: pi0_5_server
 
 experiment:
-  exp_name: pi0_5_inference
+  exp_name: pi0_5_inference_pick
   exp_dir: outputs/${experiment.exp_name}
   model: /models/lerobot/pi0_5
   task:
     type: inference
     backend: vllm # TODO: Remove this restriction
-    entrypoint: flagscale/inference/inference_pi.py
+    entrypoint: flagscale/inference/http_pi05_server.py
   runner:
     hostfile: null
   cmds:

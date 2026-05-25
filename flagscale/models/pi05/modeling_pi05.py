@@ -24,8 +24,10 @@ from collections import deque
 from pathlib import Path
 from typing import Literal, TypedDict, TypeVar
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from torch import Tensor, nn
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
@@ -47,6 +49,28 @@ from flagscale.models.utils.constants import (
 )
 from flagscale.models.vla.base_policy import TrainablePolicy
 from flagscale.platforms import get_platform
+
+_DEBUG_INFERENCE = True
+_DEBUG_DIR = None
+
+
+def _get_debug_dir():
+    global _DEBUG_DIR
+    if _DEBUG_DIR is None:
+        import os
+        _DEBUG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../inference/debug_tensors")
+        _DEBUG_DIR = os.path.normpath(_DEBUG_DIR)
+        os.makedirs(_DEBUG_DIR, exist_ok=True)
+    return _DEBUG_DIR
+
+
+def _debug_save(name, data):
+    if not _DEBUG_INFERENCE:
+        return
+    import os
+    path = os.path.join(_get_debug_dir(), name)
+    torch.save(data, path)
+
 
 T = TypeVar("T", bound="PI05Policy")
 
@@ -141,17 +165,18 @@ def pad_vector(vector, new_dim):
     return F.pad(vector, (0, new_dim - vector.shape[-1]))
 
 
-def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
+def resize_with_pad_torch(
     images: torch.Tensor, height: int, width: int, mode: str = "bilinear"
 ) -> torch.Tensor:
-    """PyTorch version of resize_with_pad. Resizes an image to a target height and width without distortion
-    by padding with black. If the image is float32, it must be in the range [-1, 1].
+    """PyTorch version of resize_with_pad using PIL BILINEAR for exact match with JAX.
+    Resizes an image to a target height and width without distortion by padding with black.
+    If the image is float32, it must be in the range [-1, 1].
 
     Args:
         images: Tensor of shape [*b, h, w, c] or [*b, c, h, w]
         height: Target height
         width: Target width
-        mode: Interpolation mode ('bilinear', 'nearest', etc.)
+        mode: Interpolation mode ('bilinear' uses PIL BILINEAR, 'nearest' uses PIL NEAREST)
 
     Returns:
         Resized and padded tensor with same shape format as input
@@ -174,21 +199,35 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
     resized_height = int(cur_height / ratio)
     resized_width = int(cur_width / ratio)
 
-    # Resize
-    resized_images = F.interpolate(
-        images,
-        size=(resized_height, resized_width),
-        mode=mode,
-        align_corners=False if mode == "bilinear" else None,
-    )
+    # Use PIL for resizing to match JAX exactly
+    pil_mode = Image.BILINEAR if mode == "bilinear" else Image.NEAREST
+    resized_batch = []
 
-    # Handle dtype-specific clipping
-    if images.dtype == torch.uint8:
-        resized_images = torch.round(resized_images).clamp(0, 255).to(torch.uint8)
-    elif images.dtype == torch.float32:
-        resized_images = resized_images.clamp(0.0, 1.0)
-    else:
-        raise ValueError(f"Unsupported image dtype: {images.dtype}")
+    for i in range(batch_size):
+        img = images[i]  # [C, H, W]
+
+        # Convert to [H, W, C] numpy for PIL
+        if img.dtype == torch.uint8:
+            img_np = img.permute(1, 2, 0).cpu().numpy()
+        else:
+            # float32 in [-1, 1] -> convert to uint8 for PIL
+            img_np = ((img.permute(1, 2, 0).cpu() + 1.0) * 127.5).clamp(0, 255).to(torch.uint8).numpy()
+
+        # Resize with PIL
+        pil_img = Image.fromarray(img_np)
+        pil_resized = pil_img.resize((resized_width, resized_height), pil_mode)
+        resized_np = np.array(pil_resized)
+
+        # Convert back to tensor
+        if images.dtype == torch.uint8:
+            resized_tensor = torch.from_numpy(resized_np).permute(2, 0, 1)  # [H, W, C] -> [C, H, W]
+        else:
+            # uint8 -> float32 in [-1, 1]
+            resized_tensor = torch.from_numpy(resized_np).float().permute(2, 0, 1) / 127.5 - 1.0
+
+        resized_batch.append(resized_tensor)
+
+    resized_images = torch.stack(resized_batch).to(images.device)
 
     # Calculate padding
     pad_h0, remainder_h = divmod(height - resized_height, 2)
@@ -197,7 +236,11 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
     pad_w1 = pad_w0 + remainder_w
 
     # Pad
-    constant_value = 0 if images.dtype == torch.uint8 else 0.0
+    if images.dtype == torch.uint8:
+        constant_value = 0
+    else:
+        constant_value = -1.0  # For float32 in [-1, 1] range, pad with -1 (black)
+
     padded_images = F.pad(
         resized_images,
         (pad_w0, pad_w1, pad_h0, pad_h1),  # left, right, top, bottom
@@ -392,6 +435,7 @@ class PaliGemmaWithExpertModel(
             self.paligemma.model.vision_tower.eval()
         if self.train_expert_only:
             self.paligemma.eval()
+        return self
 
     def to_bfloat16_for_selected_params(
         self, precision: Literal["bfloat16", "float32"] = "bfloat16"
@@ -405,8 +449,9 @@ class PaliGemmaWithExpertModel(
             raise ValueError(f"Invalid precision: {precision}")
 
         params_to_keep_float32 = [
-            "vision_tower",
-            "multi_modal_projector",
+            "vision_tower.vision_model.embeddings.patch_embedding.weight",
+            "vision_tower.vision_model.embeddings.patch_embedding.bias",
+            "vision_tower.vision_model.embeddings.position_embedding.weight",
             "input_layernorm",
             "post_attention_layernorm",
             "model.norm",
@@ -417,13 +462,11 @@ class PaliGemmaWithExpertModel(
                 param.data = param.data.to(dtype=torch.float32)
 
     def embed_image(self, image: torch.Tensor):
-        out_dtype = image.dtype
-        if image.dtype != torch.float32:
-            image = image.to(torch.float32)
-        features = self.paligemma.model.get_image_features(image)
-        if features.dtype != out_dtype:
-            features = features.to(out_dtype)
-        return features
+        vision_tower = self.paligemma.model.vision_tower.vision_model
+        vision_tower.encoder.config._attn_implementation = "eager"
+        for layer in vision_tower.encoder.layers:
+            layer.self_attn.config._attn_implementation = "eager"
+        return self.paligemma.model.get_image_features(image)
 
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.model.language_model.embed_tokens(tokens)
@@ -606,7 +649,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return torch.where(att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
 
     def sample_noise(self, shape, device):
-        return torch.normal(mean=0.0, std=1.0, size=shape, dtype=torch.float32, device=device)
+        generator = torch.Generator(device=device).manual_seed(42)
+        return torch.normal(mean=0.0, std=1.0, size=shape, dtype=torch.float32, device=device, generator=generator)
 
     def sample_time(self, bsize, device):
         time_beta = sample_beta(
@@ -624,6 +668,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_masks = []
 
         # Process images
+        img_embs_debug = []
         for img, img_mask in zip(images, img_masks, strict=True):
 
             def image_embed_func(img):
@@ -633,6 +678,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             bsize, num_img_embs = img_emb.shape[:2]
 
             embs.append(img_emb)
+            img_embs_debug.append(img_emb.detach().cpu())
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
             att_masks += [0] * num_img_embs
 
@@ -645,6 +691,14 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         lang_emb = self._apply_checkpoint(lang_embed_func, tokens)
         embs.append(lang_emb)
         pad_masks.append(masks)
+
+        # Save debug tensors
+        _debug_save("07_embed_prefix_detail.pt", {
+            "img_embs": img_embs_debug,
+            "lang_emb": lang_emb.detach().cpu(),
+            "tokens": tokens.detach().cpu(),
+            "masks": masks.detach().cpu(),
+        })
 
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
@@ -799,6 +853,14 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
+        _debug_save("08_prefix_embs.pt", {
+            "prefix_embs": prefix_embs.detach().cpu(),
+            "prefix_pad_masks": prefix_pad_masks.detach().cpu(),
+            "prefix_att_masks": prefix_att_masks.detach().cpu(),
+            "prefix_position_ids": prefix_position_ids.detach().cpu(),
+            "noise": noise.detach().cpu(),
+        })
+
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = (
             "eager"
@@ -815,6 +877,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         dt = -1.0 / num_steps
 
         x_t = noise
+        denoising_steps = []
         for step in range(num_steps):
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
@@ -845,8 +908,24 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
             x_t = x_t + dt * v_t
 
+            if step == 0:
+                _debug_save("06_denoise_step0.pt", {
+                    "v_t_step0": v_t.detach().cpu(),
+                    "x_t_after_step0": x_t.detach().cpu(),
+                    "time_step0": time_tensor.detach().cpu(),
+                })
+
+            denoising_steps.append({
+                "step": step,
+                "time": time,
+                "x_t": x_t.detach().cpu(),
+                "v_t": v_t.detach().cpu(),
+            })
+
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
+
+        _debug_save("09_denoising_steps.pt", denoising_steps)
 
         return x_t
 
@@ -1037,6 +1116,14 @@ class PI05Policy(TrainablePolicy):
             if not missing_keys and not unexpected_keys:
                 print("All keys loaded successfully!")
 
+            # Re-apply bf16 conversion after loading to match source (openpi) behavior:
+            # source loads weights then calls to_bfloat16_for_selected_params, causing a
+            # lossy float32->bf16->float32 round-trip on patch_embedding/position_embedding
+            # that amplifies to ~3.0 max diff through 27 SiGLIP encoder layers.
+            model.model.paligemma_with_expert.to_bfloat16_for_selected_params(
+                model.config.dtype
+            )
+
         except Exception as e:
             print(f"Warning: Could not remap state dict keys: {e}")
 
@@ -1132,8 +1219,9 @@ class PI05Policy(TrainablePolicy):
     def _preprocess_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
         """Preprocess images for the model.
 
-        Images from LeRobot are typically in [B, C, H, W] format and normalized to [0, 1].
-        PaliGemma expects images in [B, C, H, W] format and normalized to [-1, 1].
+        Images can arrive as uint8 [0, 255] or float32 [-1, 1].
+        Resize is done in uint8 space to avoid lossy float->uint8 round-trips,
+        then converted to float via / 127.5 - 1.0 to match source (openpi).
         """
         images = []
         img_masks = []
@@ -1158,32 +1246,41 @@ class PI05Policy(TrainablePolicy):
             if img.device != device:
                 img = img.to(device)
 
-            # Ensure float32 dtype for consistency
-            if img.dtype != torch.float32:
-                img = img.to(torch.float32)
-
             # from openpi preprocess_observation_pytorch: Handle both [B, C, H, W] and [B, H, W, C] formats
-            is_channels_first = img.shape[1] == 3  # Check if channels are in dimension 1
+            is_channels_first = img.shape[1] == 3 or (img.dtype == torch.uint8 and img.shape[1] == 3)
 
             if is_channels_first:
                 # Convert [B, C, H, W] to [B, H, W, C] for processing
                 img = img.permute(0, 2, 3, 1)
 
+            # Detect zero/placeholder images before any conversion
+            if img.dtype == torch.uint8:
+                is_zero_image = (img == 0).all()
+            else:
+                is_zero_image = (img == -1.0).all()
+
             # from openpi preprocess_observation_pytorch: Resize with padding if needed
             if img.shape[1:3] != self.config.image_resolution:
                 img = resize_with_pad_torch(img, *self.config.image_resolution)
 
-            # Normalize from [0,1] to [-1,1] as expected by siglip
-            img = img * 2.0 - 1.0
+            # Convert uint8 to float32 [-1, 1] after resize (matches source: / 127.5 - 1.0)
+            if img.dtype == torch.uint8:
+                img = img.float() / 127.5 - 1.0
+
+            # Ensure float32 dtype
+            if img.dtype != torch.float32:
+                img = img.to(torch.float32)
 
             # from openpi preprocess_observation_pytorch: Convert back to [B, C, H, W] format if it was originally channels-first
             if is_channels_first:
                 img = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
 
             images.append(img)
-            # Create mask (all ones for real images)
             bsize = img.shape[0]
-            mask = torch.ones(bsize, dtype=torch.bool, device=device)
+            if is_zero_image:
+                mask = torch.zeros(bsize, dtype=torch.bool, device=device)
+            else:
+                mask = torch.ones(bsize, dtype=torch.bool, device=device)
             img_masks.append(mask)
 
         # Create image features not present in the batch as fully 0 padded images
@@ -1192,6 +1289,11 @@ class PI05Policy(TrainablePolicy):
             mask = torch.zeros_like(mask)  # Mask is zero for empty cameras
             images.append(img)
             img_masks.append(mask)
+
+        _debug_save("05_preprocess_images.pt", {
+            "images": [img.detach().cpu() for img in images],
+            "img_masks": [mask.detach().cpu() for mask in img_masks],
+        })
 
         return images, img_masks
 
@@ -1228,12 +1330,19 @@ class PI05Policy(TrainablePolicy):
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = (batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"])
 
+        _debug_save("06_model_inputs.pt", {
+            "tokens": tokens.detach().cpu(),
+            "masks": masks.detach().cpu(),
+        })
+
         # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
         actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
 
         # Unpad actions to actual action dimension
         original_action_dim = self.config.output_features[ACTION].shape[0]
         actions = actions[:, :, :original_action_dim]
+
+        _debug_save("10_actions_final.pt", actions.detach().cpu())
 
         return actions
 

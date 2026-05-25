@@ -73,11 +73,8 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         # TODO: check if this necessary
         state = deepcopy(state)
 
-        # Prepare state (pad to max_state_dim)
-        state = pad_vector(state, self.max_state_dim)
-
-        # State should already be normalized to [-1, 1] by the NormalizerProcessorStep that runs before this step
-        # Discretize into 256 bins (see openpi `PaligemmaTokenizer.tokenize()`)
+        # Discretize the original state (before padding) into 256 bins
+        # This matches openpi's PaligemmaTokenizer.tokenize() which receives state before padding
         state_np = state.cpu().numpy()
         discretized_states = np.digitize(state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
 

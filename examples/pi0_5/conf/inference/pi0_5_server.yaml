@@ -1,0 +1,10 @@
+engine:
+  model_variant: "pi0.5"
+  model: /workspace/models/lerobot/pi05_pick_bottle
+  tokenizer: /workspace/models/google/paligemma-3b-pt-224
+  device: "cuda"
+  dtype: "bfloat16"
+  compile: false
+
+generate:
+  rename_map: {}
