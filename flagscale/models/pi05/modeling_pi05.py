@@ -50,26 +50,6 @@ from flagscale.models.utils.constants import (
 from flagscale.models.vla.base_policy import TrainablePolicy
 from flagscale.platforms import get_platform
 
-_DEBUG_INFERENCE = True
-_DEBUG_DIR = None
-
-
-def _get_debug_dir():
-    global _DEBUG_DIR
-    if _DEBUG_DIR is None:
-        import os
-        _DEBUG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../inference/debug_tensors")
-        _DEBUG_DIR = os.path.normpath(_DEBUG_DIR)
-        os.makedirs(_DEBUG_DIR, exist_ok=True)
-    return _DEBUG_DIR
-
-
-def _debug_save(name, data):
-    if not _DEBUG_INFERENCE:
-        return
-    import os
-    path = os.path.join(_get_debug_dir(), name)
-    torch.save(data, path)
 
 
 T = TypeVar("T", bound="PI05Policy")
@@ -83,7 +63,7 @@ class ActionSelectKwargs(TypedDict, total=False):
 
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
-    if device_type == "mps" and target_dtype == torch.float64:
+    if target_dtype == torch.float64:
         return torch.float32
     if device_type == "cpu":
         # CPU doesn't support bfloat16, use float32 instead
@@ -449,9 +429,8 @@ class PaliGemmaWithExpertModel(
             raise ValueError(f"Invalid precision: {precision}")
 
         params_to_keep_float32 = [
-            "vision_tower.vision_model.embeddings.patch_embedding.weight",
-            "vision_tower.vision_model.embeddings.patch_embedding.bias",
-            "vision_tower.vision_model.embeddings.position_embedding.weight",
+            "vision_tower.",  # entire SiGLIP vision tower (receives float32 images)
+            "multi_modal_projector.",  # projects vision features; input is float32 from vision tower
             "input_layernorm",
             "post_attention_layernorm",
             "model.norm",
@@ -463,9 +442,6 @@ class PaliGemmaWithExpertModel(
 
     def embed_image(self, image: torch.Tensor):
         vision_tower = self.paligemma.model.vision_tower.vision_model
-        vision_tower.encoder.config._attn_implementation = "eager"
-        for layer in vision_tower.encoder.layers:
-            layer.self_attn.config._attn_implementation = "eager"
         return self.paligemma.model.get_image_features(image)
 
     def embed_language_tokens(self, tokens: torch.Tensor):
@@ -668,7 +644,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_masks = []
 
         # Process images
-        img_embs_debug = []
         for img, img_mask in zip(images, img_masks, strict=True):
 
             def image_embed_func(img):
@@ -678,7 +653,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             bsize, num_img_embs = img_emb.shape[:2]
 
             embs.append(img_emb)
-            img_embs_debug.append(img_emb.detach().cpu())
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
             att_masks += [0] * num_img_embs
 
@@ -691,14 +665,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         lang_emb = self._apply_checkpoint(lang_embed_func, tokens)
         embs.append(lang_emb)
         pad_masks.append(masks)
-
-        # Save debug tensors
-        _debug_save("07_embed_prefix_detail.pt", {
-            "img_embs": img_embs_debug,
-            "lang_emb": lang_emb.detach().cpu(),
-            "tokens": tokens.detach().cpu(),
-            "masks": masks.detach().cpu(),
-        })
 
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
@@ -853,14 +819,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
-        _debug_save("08_prefix_embs.pt", {
-            "prefix_embs": prefix_embs.detach().cpu(),
-            "prefix_pad_masks": prefix_pad_masks.detach().cpu(),
-            "prefix_att_masks": prefix_att_masks.detach().cpu(),
-            "prefix_position_ids": prefix_position_ids.detach().cpu(),
-            "noise": noise.detach().cpu(),
-        })
-
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = (
             "eager"
@@ -877,7 +835,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         dt = -1.0 / num_steps
 
         x_t = noise
-        denoising_steps = []
         for step in range(num_steps):
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
@@ -908,24 +865,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
             x_t = x_t + dt * v_t
 
-            if step == 0:
-                _debug_save("06_denoise_step0.pt", {
-                    "v_t_step0": v_t.detach().cpu(),
-                    "x_t_after_step0": x_t.detach().cpu(),
-                    "time_step0": time_tensor.detach().cpu(),
-                })
-
-            denoising_steps.append({
-                "step": step,
-                "time": time,
-                "x_t": x_t.detach().cpu(),
-                "v_t": v_t.detach().cpu(),
-            })
-
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
-
-        _debug_save("09_denoising_steps.pt", denoising_steps)
 
         return x_t
 
@@ -1298,11 +1239,6 @@ class PI05Policy(TrainablePolicy):
             images.append(img)
             img_masks.append(mask)
 
-        _debug_save("05_preprocess_images.pt", {
-            "images": [img.detach().cpu() for img in images],
-            "img_masks": [mask.detach().cpu() for mask in img_masks],
-        })
-
         return images, img_masks
 
     def prepare_action(self, batch):
@@ -1338,19 +1274,12 @@ class PI05Policy(TrainablePolicy):
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = (batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"])
 
-        _debug_save("06_model_inputs.pt", {
-            "tokens": tokens.detach().cpu(),
-            "masks": masks.detach().cpu(),
-        })
-
         # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
         actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
 
         # Unpad actions to actual action dimension
         original_action_dim = self.config.output_features[ACTION].shape[0]
         actions = actions[:, :, :original_action_dim]
-
-        _debug_save("10_actions_final.pt", actions.detach().cpu())
 
         return actions
 

@@ -55,6 +55,13 @@ def load_model(config_path: str):
     policy.eval()
     logger.info("pi0.5 model loaded successfully")
 
+    # Register debug hooks if enabled
+    if engine_cfg.get("debug_hooks", False):
+        from flagscale.inference.hooks import register_debug_hooks
+        logger.info("Registering debug hooks on entire PI05Pytorch model...")
+        register_debug_hooks(policy.model)
+        logger.info("Debug hooks registered")
+
     use_compile = engine_cfg.get("compile", False)
     if use_compile:
         compile_mode = engine_cfg.get("compile_mode", "default")
