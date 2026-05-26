@@ -28,10 +28,14 @@ from transformers.models.gemma.modeling_gemma import (
     GemmaForCausalLM,
     GemmaMLP,
     GemmaModel,
+    GemmaPreTrainedModel,
+    GemmaRotaryEmbedding,
 )
 from transformers.models.paligemma.modeling_paligemma import (
     PaliGemmaForConditionalGeneration,
     PaliGemmaModel,
+    PaliGemmaMultiModalProjector,
+    PaliGemmaPreTrainedModel,
 )
 
 
@@ -180,7 +184,12 @@ class PiGemmaModel(GemmaModel):
     """
 
     def __init__(self, config: GemmaConfig, **kwargs):
-        super().__init__(config, **kwargs)
+        # Skip GemmaModel.__init__ to avoid allocating standard GemmaDecoderLayers
+        # that would immediately be replaced.
+        GemmaPreTrainedModel.__init__(self, config)
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         cond_dim = getattr(config, "adarms_cond_dim", None)
         pi_gemma_decoder_layer_base = _get_pi_gemma_decoder_layer_base()
         self.layers = nn.ModuleList(
@@ -190,6 +199,10 @@ class PiGemmaModel(GemmaModel):
             ]
         )
         self.norm = PiGemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, cond_dim=cond_dim)
+        self.rotary_emb = GemmaRotaryEmbedding(config=config)
+        self.gradient_checkpointing = False
+        # Skip post_init() — weights will be loaded from pretrained, and post_init's
+        # _init_weights expects standard GemmaRMSNorm.weight which PiGemmaRMSNorm doesn't have
 
     def forward(
         self,
@@ -311,16 +324,27 @@ class PiGemmaForCausalLM(GemmaForCausalLM):
     """
 
     def __init__(self, config: GemmaConfig, **kwargs):
-        super().__init__(config, **kwargs)
+        # Skip GemmaForCausalLM.__init__ to avoid allocating a standard GemmaModel
+        # that would immediately be replaced.
+        GemmaPreTrainedModel.__init__(self, config)
         self.model = PiGemmaModel(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
 
 class PaliGemmaModelWithPiGemma(PaliGemmaModel):
     """PaliGemmaModel whose language_model is PiGemmaModel (custom decoder with PiGemmaRMSNorm and gated residuals)."""
 
     def __init__(self, config):
-        super().__init__(config)
+        # Skip PaliGemmaModel.__init__ to avoid allocating a standard GemmaModel
+        # as language_model that would immediately be replaced.
+        PaliGemmaPreTrainedModel.__init__(self, config)
+        from transformers import AutoModel
+        self.vision_tower = AutoModel.from_config(config=config.vision_config)
+        self.multi_modal_projector = PaliGemmaMultiModalProjector(config)
+        self.vocab_size = config.text_config.vocab_size
         self.language_model = PiGemmaModel(config.text_config)
+        self.pad_token_id = config.pad_token_id if config.pad_token_id is not None else -1
 
     def get_image_features(self, pixel_values):
         """Override to remove the / hidden_size**0.5 scaling that stock HuggingFace adds.
@@ -335,8 +359,11 @@ class PaliGemmaForConditionalGenerationWithPiGemma(PaliGemmaForConditionalGenera
     """PaliGemmaForConditionalGeneration using PiGemma decoder for the language model."""
 
     def __init__(self, config):
-        super().__init__(config)
+        # Skip PaliGemmaForConditionalGeneration.__init__ to avoid allocating a
+        # standard PaliGemmaModel that would immediately be replaced.
+        PaliGemmaPreTrainedModel.__init__(self, config)
         self.model = PaliGemmaModelWithPiGemma(config)
+        self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
 
     @property
     def language_model(self):

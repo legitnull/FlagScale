@@ -5,6 +5,8 @@ engine:
   device: "cuda"
   dtype: "bfloat16"
   compile: false
+  # model: /share/fshare/common/models/flagscale/workspace/models/lerobot/pi05_pick_bottle
+  # tokenizer: /share/fshare/common/models/flagscale/workspace/models/google/paligemma-3b-pt-224
 
 generate:
   rename_map: {}

@@ -22,12 +22,16 @@ import numpy as np
 import torch
 from safetensors.torch import load_file, save_file
 
-from megatron.plugin.platform import get_platform
+#from megatron.plugin.platform import get_platform
 
 from flagscale.models.utils.constants import RNG_STATE
 from flagscale.train.datasets.utils import flatten_dict, unflatten_dict
 
-cur_platform = get_platform()
+class Platform:
+    def is_available():
+        return False
+
+cur_platform = Platform()
 
 
 def serialize_python_rng_state() -> dict[str, torch.Tensor]:

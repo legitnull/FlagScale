@@ -1070,6 +1070,7 @@ class PI05Policy(TrainablePolicy):
 
             # First, fix any key differences # see openpi `model.py, _fix_pytorch_state_dict_keys`
             fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
+            del original_state_dict
 
             # Then add "model." prefix for all keys that don't already have it
             remapped_state_dict = {}
@@ -1084,6 +1085,8 @@ class PI05Policy(TrainablePolicy):
                         print(f"Remapped: {key} -> {new_key}")
                 else:
                     remapped_state_dict[key] = value
+
+            del fixed_state_dict
 
             if remap_count > 0:
                 print(f"Remapped {remap_count} state dict keys")
@@ -1115,6 +1118,11 @@ class PI05Policy(TrainablePolicy):
 
             if not missing_keys and not unexpected_keys:
                 print("All keys loaded successfully!")
+
+            # Free memory before bf16 conversion
+            del remapped_state_dict
+            import gc
+            gc.collect()
 
             # Re-apply bf16 conversion after loading to match source (openpi) behavior:
             # source loads weights then calls to_bfloat16_for_selected_params, causing a
