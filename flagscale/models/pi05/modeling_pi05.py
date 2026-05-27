@@ -27,7 +27,6 @@ from typing import Literal, TypedDict, TypeVar
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
 from torch import Tensor, nn
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
@@ -145,18 +144,17 @@ def pad_vector(vector, new_dim):
     return F.pad(vector, (0, new_dim - vector.shape[-1]))
 
 
-def resize_with_pad_torch(
+def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
     images: torch.Tensor, height: int, width: int, mode: str = "bilinear"
 ) -> torch.Tensor:
-    """PyTorch version of resize_with_pad using PIL BILINEAR for exact match with JAX.
-    Resizes an image to a target height and width without distortion by padding with black.
-    If the image is float32, it must be in the range [-1, 1].
+    """PyTorch version of resize_with_pad. Resizes an image to a target height and width without distortion
+    by padding with black. If the image is float32, it must be in the range [-1, 1].
 
     Args:
         images: Tensor of shape [*b, h, w, c] or [*b, c, h, w]
         height: Target height
         width: Target width
-        mode: Interpolation mode ('bilinear' uses PIL BILINEAR, 'nearest' uses PIL NEAREST)
+        mode: Interpolation mode ('bilinear', 'nearest', etc.)
 
     Returns:
         Resized and padded tensor with same shape format as input
@@ -179,35 +177,19 @@ def resize_with_pad_torch(
     resized_height = int(cur_height / ratio)
     resized_width = int(cur_width / ratio)
 
-    # Use PIL for resizing to match JAX exactly
-    pil_mode = Image.BILINEAR if mode == "bilinear" else Image.NEAREST
-    resized_batch = []
+    # Resize
+    resized_images = F.interpolate(
+        images.float(),
+        size=(resized_height, resized_width),
+        mode=mode,
+        align_corners=False if mode == "bilinear" else None,
+    )
 
-    for i in range(batch_size):
-        img = images[i]  # [C, H, W]
-
-        # Convert to [H, W, C] numpy for PIL
-        if img.dtype == torch.uint8:
-            img_np = img.permute(1, 2, 0).cpu().numpy()
-        else:
-            # float32 in [-1, 1] -> convert to uint8 for PIL
-            img_np = ((img.permute(1, 2, 0).cpu() + 1.0) * 127.5).clamp(0, 255).to(torch.uint8).numpy()
-
-        # Resize with PIL
-        pil_img = Image.fromarray(img_np)
-        pil_resized = pil_img.resize((resized_width, resized_height), pil_mode)
-        resized_np = np.array(pil_resized)
-
-        # Convert back to tensor
-        if images.dtype == torch.uint8:
-            resized_tensor = torch.from_numpy(resized_np).permute(2, 0, 1)  # [H, W, C] -> [C, H, W]
-        else:
-            # uint8 -> float32 in [-1, 1]
-            resized_tensor = torch.from_numpy(resized_np).float().permute(2, 0, 1) / 127.5 - 1.0
-
-        resized_batch.append(resized_tensor)
-
-    resized_images = torch.stack(resized_batch).to(images.device)
+    # Handle dtype-specific clipping
+    if images.dtype == torch.uint8:
+        resized_images = torch.round(resized_images).clamp(0, 255).to(torch.uint8)
+    elif images.dtype == torch.float32:
+        resized_images = resized_images.clamp(-1.0, 1.0)
 
     # Calculate padding
     pad_h0, remainder_h = divmod(height - resized_height, 2)
@@ -219,7 +201,7 @@ def resize_with_pad_torch(
     if images.dtype == torch.uint8:
         constant_value = 0
     else:
-        constant_value = -1.0  # For float32 in [-1, 1] range, pad with -1 (black)
+        constant_value = -1.0
 
     padded_images = F.pad(
         resized_images,
@@ -441,8 +423,13 @@ class PaliGemmaWithExpertModel(
                 param.data = param.data.to(dtype=torch.float32)
 
     def embed_image(self, image: torch.Tensor):
-        vision_tower = self.paligemma.model.vision_tower.vision_model
-        return self.paligemma.model.get_image_features(image)
+        out_dtype = image.dtype
+        if image.dtype != torch.float32:
+            image = image.to(torch.float32)
+        features = self.paligemma.model.get_image_features(image)
+        if features.dtype != out_dtype:
+            features = features.to(out_dtype)
+        return features
 
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.model.language_model.embed_tokens(tokens)
@@ -625,8 +612,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return torch.where(att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
 
     def sample_noise(self, shape, device):
-        generator = torch.Generator(device=device).manual_seed(42)
-        return torch.normal(mean=0.0, std=1.0, size=shape, dtype=torch.float32, device=device, generator=generator)
+        return torch.randn(size=shape, dtype=torch.float32, device=device)
 
     def sample_time(self, bsize, device):
         time_beta = sample_beta(
@@ -813,9 +799,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )  # Use config max_action_dim for internal processing
             noise = self.sample_noise(actions_shape, device)
 
+        import time as _time
+        torch.cuda.synchronize()
+        _t0 = _time.perf_counter()
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, tokens, masks
         )
+        torch.cuda.synchronize()
+        _t_embed = _time.perf_counter()
+        print(f"[TIMER] embed_prefix (vision+lang): {(_t_embed-_t0)*1000:.2f}ms", flush=True)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
@@ -824,6 +816,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             "eager"
         )
 
+        import time as _time
+        torch.cuda.synchronize()
+        _t0 = _time.perf_counter()
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
@@ -831,10 +826,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
         )
+        torch.cuda.synchronize()
+        _t1 = _time.perf_counter()
+        print(f"[TIMER] LLM prefix forward: {(_t1-_t0)*1000:.2f}ms", flush=True)
 
         dt = -1.0 / num_steps
 
         x_t = noise
+        torch.cuda.synchronize()
+        _t_denoise_start = _time.perf_counter()
         for step in range(num_steps):
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
@@ -867,6 +867,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
+
+        torch.cuda.synchronize()
+        _t_denoise_end = _time.perf_counter()
+        print(f"[TIMER] Action head (denoise loop x{num_steps}): {(_t_denoise_end-_t_denoise_start)*1000:.2f}ms", flush=True)
 
         return x_t
 
@@ -1268,14 +1272,21 @@ class PI05Policy(TrainablePolicy):
         self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]
     ) -> Tensor:
         """Predict a chunk of actions given environment observations."""
+        import time as _time
         self.eval()
 
         # Prepare inputs
+        _t0 = _time.perf_counter()
         images, img_masks = self._preprocess_images(batch)
+        _t1 = _time.perf_counter()
+        print(f"[TIMER]   _preprocess_images: {(_t1-_t0)*1000:.2f}ms", flush=True)
+
         tokens, masks = (batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"])
 
         # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
         actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
+        _t2 = _time.perf_counter()
+        print(f"[TIMER]   model.sample_actions: {(_t2-_t1)*1000:.2f}ms", flush=True)
 
         # Unpad actions to actual action dimension
         original_action_dim = self.config.output_features[ACTION].shape[0]

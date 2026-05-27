@@ -55,16 +55,9 @@ def load_model(config_path: str):
     policy.eval()
     logger.info("pi0.5 model loaded successfully")
 
-    # Register debug hooks if enabled
-    if engine_cfg.get("debug_hooks", False):
-        from flagscale.inference.hooks import register_debug_hooks
-        logger.info("Registering debug hooks on entire PI05Pytorch model...")
-        register_debug_hooks(policy.model)
-        logger.info("Debug hooks registered")
-
     use_compile = engine_cfg.get("compile", False)
     if use_compile:
-        compile_mode = engine_cfg.get("compile_mode", "default")
+        compile_mode = engine_cfg.get("compile_mode", "max-autotune")
         policy.model.denoise_step = torch.compile(policy.model.denoise_step, mode=compile_mode)
         logger.info(f"torch.compile applied (mode={compile_mode})")
 
@@ -152,21 +145,36 @@ def _build_batch(state: np.ndarray, input_img: np.ndarray, prompt: str) -> dict:
 
 
 def sample_actions(state: list, input_img: np.ndarray, prompt: str = "pick the apple and put into the basket") -> np.ndarray:
+    import time as _time
     state_array = np.array(state, dtype=np.float32)
+
+    _t0 = _time.perf_counter()
     batch = _build_batch(state=state_array, input_img=input_img, prompt=prompt)
+    _t1 = _time.perf_counter()
+    print(f"[TIMER] _build_batch: {(_t1-_t0)*1000:.2f}ms", flush=True)
 
     batch = preprocessor(batch)
+    _t2 = _time.perf_counter()
+    print(f"[TIMER] preprocessor: {(_t2-_t1)*1000:.2f}ms", flush=True)
 
     with torch.no_grad():
         action = policy.predict_action_chunk(batch)
+    _t3 = _time.perf_counter()
+    print(f"[TIMER] predict_action_chunk: {(_t3-_t2)*1000:.2f}ms", flush=True)
 
     action = postprocessor(action)
+    _t4 = _time.perf_counter()
+    print(f"[TIMER] postprocessor: {(_t4-_t3)*1000:.2f}ms", flush=True)
 
     # AbsoluteActions: first 6 dims are deltas, add current state
     state_tensor = torch.tensor(state_array, dtype=torch.float32, device=action.device).unsqueeze(0)
     action[..., :6] += state_tensor[:, :6].unsqueeze(-2)
 
-    return action.cpu().numpy()
+    result = action.cpu().numpy()
+    _t5 = _time.perf_counter()
+    print(f"[TIMER] postprocess+cpu: {(_t5-_t3)*1000:.2f}ms", flush=True)
+
+    return result
 
 
 @app.route("/hello", methods=["GET"])
@@ -179,19 +187,27 @@ def hello():
 
 @app.route("/inference_pi05", methods=["POST"])
 def inference_pi05():
-    start_time = time.time()
+    import time as _time
+    start_time = _time.perf_counter()
 
+    _t0 = _time.perf_counter()
     image_file = request.files["image"]
     json_data = request.form["json"]
     data = json.loads(json_data)
+    _t1 = _time.perf_counter()
+    print(f"[TIMER] HTTP parse: {(_t1-_t0)*1000:.2f}ms", flush=True)
 
     image = PIL_Image.open(image_file.stream).convert("RGB")
     img_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    _t2 = _time.perf_counter()
+    print(f"[TIMER] Image decode: {(_t2-_t1)*1000:.2f}ms", flush=True)
 
     prompt = data.get("prompt", "pick the apple and put into the basket")
     action_chunk = sample_actions(state=data["state"], input_img=img_bgr, prompt=prompt)
+    _t3 = _time.perf_counter()
+    print(f"[TIMER] sample_actions total: {(_t3-_t2)*1000:.2f}ms", flush=True)
 
-    inference_time = time.time() - start_time
+    inference_time = _time.perf_counter() - start_time
     logger.info(f"Inference time: {inference_time:.3f}s, action shape: {action_chunk.shape}")
 
     return jsonify({
