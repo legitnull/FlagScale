@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - inference: pi0_5
+  - inference: pi0_5_openpi_server
 
 experiment:
   exp_name: pi0_5_inference
@@ -9,7 +9,7 @@ experiment:
   task:
     type: inference
     backend: vllm # TODO: Remove this restriction
-    entrypoint: flagscale/inference/inference_pi.py
+    entrypoint: flagscale/inference/inference_pi05_openpi.py
   runner:
     hostfile: null
   cmds:
