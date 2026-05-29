@@ -11,16 +11,6 @@ from flagscale.models.openpi05.gemma_pytorch import PaliGemmaWithExpertModel
 from flagscale.models.openpi05 import preprocessing_pytorch as _preprocessing
 
 
-def get_safe_dtype(target_dtype, device_type):
-    """Get a safe dtype for the given device type."""
-    if device_type == "cpu":
-        # CPU doesn't support bfloat16, use float32 instead
-        if target_dtype == torch.bfloat16:
-            return torch.float32
-        if target_dtype == torch.float64:
-            return torch.float64
-    return target_dtype
-
 
 def create_sinusoidal_pos_embedding(
     time: torch.tensor, dimension: int, min_period: float, max_period: float, device="cpu"
@@ -32,8 +22,7 @@ def create_sinusoidal_pos_embedding(
     if time.ndim != 1:
         raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
 
-    dtype = get_safe_dtype(torch.float64, device.type)
-    fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
+    fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=torch.float32, device=device)
     period = min_period * (max_period / min_period) ** fraction
 
     # Compute the outer product
@@ -109,6 +98,7 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
         torch.set_float32_matmul_precision("high")
+        self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -193,7 +183,6 @@ class PI0Pytorch(nn.Module):
         att_masks = []
 
         # Process images
-        img_embs_debug = []
         for img, img_mask in zip(images, img_masks, strict=True):
 
             def image_embed_func(img):
@@ -204,7 +193,6 @@ class PI0Pytorch(nn.Module):
             bsize, num_img_embs = img_emb.shape[:2]
 
             embs.append(img_emb)
-            img_embs_debug.append(img_emb.cpu())
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
 
             # Create attention masks so that image tokens attend to each other
@@ -217,16 +205,6 @@ class PI0Pytorch(nn.Module):
             return lang_emb * math.sqrt(lang_emb_dim)
 
         lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
-
-        import os as _os
-        _debug_dir = "/share/project/fengyupu/github/fs5/flagscale/inference/debug_tensors_src"
-        _os.makedirs(_debug_dir, exist_ok=True)
-        torch.save({
-            "img_embs": img_embs_debug,
-            "lang_emb": lang_emb.cpu(),
-            "tokens": lang_tokens.cpu(),
-            "masks": lang_masks.cpu(),
-        }, _os.path.join(_debug_dir, "07_embed_prefix_detail.pt"))
 
         embs.append(lang_emb)
         pad_masks.append(lang_masks)

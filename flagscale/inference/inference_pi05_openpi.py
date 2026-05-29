@@ -119,9 +119,6 @@ def create_model(cfg):
     model = model.to(device)
     model.eval()
 
-    if cfg["engine"].get("compile", False):
-        model.denoise_step = torch.compile(model.denoise_step, mode="max-autotune")
-
     return model, norm_stats, device
 
 

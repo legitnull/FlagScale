@@ -1,0 +1,12 @@
+engine:
+  checkpoint_dir: /share/project/fengyupu/tools/Users/ypfeng/Documents/xyz_pick_rubbish/xyz_openpi_env/checkpoints/pi05_go2_arx_low_mem_finetune/pi05_go2_arx_low_mem_finetune_pick_bottle_exp_20260404/3999
+  asset_id: zouyi_test/rubbish-dataset-0403
+  device: "cuda:0"
+  paligemma_variant: gemma_2b_lora
+  action_expert_variant: gemma_300m_lora
+  compile: true
+
+server:
+  host: "0.0.0.0"
+  port: 5000
+  prompt: "pick the apple and put into the basket"

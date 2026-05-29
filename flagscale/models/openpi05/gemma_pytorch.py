@@ -82,10 +82,6 @@ class PaliGemmaWithExpertModel(nn.Module):
                 param.data = param.data.to(dtype=torch.float32)
 
     def embed_image(self, image: torch.Tensor):
-        vision_tower = self.paligemma.model.vision_tower.vision_model
-        vision_tower.encoder.config._attn_implementation = "eager"
-        for layer in vision_tower.encoder.layers:
-            layer.self_attn.config._attn_implementation = "eager"
         return self.paligemma.model.get_image_features(image)
 
     def embed_language_tokens(self, tokens: torch.Tensor):
