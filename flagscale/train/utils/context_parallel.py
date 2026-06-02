@@ -64,14 +64,14 @@ def patch_gated_delta_net_for_cp(model, cp_group, conv1d_kernel_size=4):
                 a = attn_module.in_proj_a(hidden_states)
 
                 # Conv1d with CP support (handles boundary tokens between ranks)
-                from fla.modules.conv.causal_conv1d import causal_conv1d_fn as fla_causal_conv1d_fn
-                mixed_qkv = fla_causal_conv1d_fn(
+                from fla.modules.conv.causal_conv1d import causal_conv1d
+                mixed_qkv = causal_conv1d(
                     x=mixed_qkv,
                     weight=attn_module.conv1d.weight.squeeze(1),
                     bias=attn_module.conv1d.bias,
                     activation=attn_module.activation,
                     cp_context=cp_ctx,
-                )
+                )[0]  # causal_conv1d returns (output, final_state), we only need output
 
                 mixed_qkv = mixed_qkv.transpose(1, 2)
                 query, key, value = torch.split(
