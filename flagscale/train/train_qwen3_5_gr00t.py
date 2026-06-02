@@ -65,6 +65,11 @@ from flagscale.train.utils.logging_utils import (
     format_big_number,
 )
 from flagscale.train.utils.optim_setup import setup_optimizer_and_scheduler
+from flagscale.train.utils.context_parallel import (
+    apply_context_parallel_to_model,
+    compute_cp_corrected_loss,
+    shard_vlm_batch_for_cp,
+)
 from flagscale.train.utils.train_utils import (
     StatefulDistributedSampler,
     get_step_checkpoint_dir,
@@ -1143,6 +1148,7 @@ def update_policy(
     lock=None,
     vlm_batch: Any = None,
     vlm_loss_scale: float = 0.0,
+    cp_group=None,
 ) -> MetricsTracker:
     """
     Performs a single training step to update the policy's weights.
@@ -1204,14 +1210,25 @@ def update_policy(
             output[key] = torch.stack([value.detach() for value in values]).mean()
 
     if vlm_batch is not None:
+        vlm_batch = shard_vlm_batch_for_cp(vlm_batch, cp_group)
+        vlm_labels_for_cp = vlm_batch["labels"].clone() if cp_group is not None else None
         with torch.profiler.record_function("forward_vlm"), autocast_context:
             policy.set_is_last_backward(True)
             vlm_output = policy(vlm_batch, mode="vlm")
-            vlm_loss_scaled = vlm_loss_scale * vlm_output["vlm_loss"]
+            vlm_loss = vlm_output["vlm_loss"]
+            if cp_group is not None:
+                shift_labels = vlm_labels_for_cp[:, 1:]
+                vlm_loss_for_backward, vlm_loss_for_log = compute_cp_corrected_loss(
+                    vlm_loss, shift_labels, cp_group
+                )
+            else:
+                vlm_loss_for_backward = vlm_loss
+                vlm_loss_for_log = vlm_loss
+            vlm_loss_scaled = vlm_loss_scale * vlm_loss_for_backward
 
         with torch.profiler.record_function("backward_vlm"):
             vlm_loss_scaled.backward()
-        output["vlm_loss"] = vlm_output["vlm_loss"]
+        output["vlm_loss"] = vlm_loss_for_log
 
     with torch.profiler.record_function("grad_clip"):
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -1393,6 +1410,7 @@ def main(config: TrainConfig, seed: int):
         vlm_dl = None
         vlm_dl_iter = None
         vlm_sampler = None
+        cp_degree = getattr(config.system, "context_parallel_degree", 1)
         if getattr(config.data, "vlm_data", None) is not None:
             # Set data root paths from YAML config before importing qwen_data_config
             vlm_data_cfg = config.data.vlm_data
@@ -1416,7 +1434,10 @@ def main(config: TrainConfig, seed: int):
                 ),
             )
             vlm_data_module = make_vlm_dataloader(
-                vlm_cfg, rank=rank, world_size=world_size, seed=seed
+                vlm_cfg,
+                rank=rank // cp_degree,
+                world_size=world_size // cp_degree,
+                seed=seed,
             )
             vlm_dl = vlm_data_module["train_dataloader"]
             vlm_sampler = vlm_data_module["sampler"]
@@ -1432,8 +1453,23 @@ def main(config: TrainConfig, seed: int):
     )
 
     # --- Apply FSDP2 ---
-    device_mesh = init_device_mesh(get_platform().name(), (world_size,))
-    apply_fsdp2(policy, device_mesh)
+    if cp_degree > 1:
+        assert world_size % cp_degree == 0, (
+            f"world_size ({world_size}) must be divisible by cp_degree ({cp_degree})"
+        )
+        dp_degree = world_size // cp_degree
+        device_mesh = init_device_mesh(
+            get_platform().name(), (dp_degree, cp_degree), mesh_dim_names=("dp", "cp")
+        )
+        dp_mesh = device_mesh["dp"]
+        cp_mesh = device_mesh["cp"]
+        cp_group = cp_mesh.get_group()
+        apply_context_parallel_to_model(policy, cp_group)
+        logger.info(f"Context parallelism enabled: cp_degree={cp_degree}, dp_degree={dp_degree}")
+    else:
+        dp_mesh = init_device_mesh(get_platform().name(), (world_size,))
+        cp_group = None
+    apply_fsdp2(policy, dp_mesh)
 
     # Setup optimizer and scheduler (applies freeze config internally)
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(policy, config)
@@ -1695,6 +1731,7 @@ def main(config: TrainConfig, seed: int):
                 lr_scheduler=lr_scheduler,
                 vlm_batch=vlm_batch,
                 vlm_loss_scale=getattr(config.system, "vlm_loss_scale", 0.1),
+                cp_group=cp_group,
             )
             train_tracker.update_s = time.perf_counter() - update_start
 
