@@ -1137,6 +1137,36 @@ def has_method(cls: object, method_name: str) -> bool:
     return hasattr(cls, method_name) and callable(getattr(cls, method_name))
 
 
+def dump_cp_tensors(step, rank, cp_degree, vlm_loss_for_log, vlm_labels_for_cp, policy, hook_logs, dump_dir="./cp_debug"):
+    """Save activations/gradients captured by hooks + scalar data for CP verification."""
+    import os
+    os.makedirs(dump_dir, exist_ok=True)
+
+    dump_data = {
+        "step": step,
+        "rank": rank,
+        "cp_degree": cp_degree,
+        "vlm_loss": vlm_loss_for_log.detach().cpu() if vlm_loss_for_log is not None else None,
+    }
+
+    grad_samples = {}
+    for name, param in policy.named_parameters():
+        if param.grad is not None and any(
+            k in name for k in [
+                "language_model.layers.0.",
+                "language_model.layers.15.",
+                "language_model.layers.31.",
+            ]
+        ):
+            grad_samples[name] = param.grad.detach().cpu().clone()
+    dump_data["grad_samples"] = grad_samples
+
+    torch.save(dump_data, f"{dump_dir}/step{step}_rank{rank}_cp{cp_degree}.pt")
+
+    with open(f"{dump_dir}/step{step}_rank{rank}_cp{cp_degree}_hooks.txt", "w") as f:
+        f.write("\n".join(hook_logs))
+
+
 def update_policy(
     train_metrics: MetricsTracker,
     policy,
@@ -1149,6 +1179,7 @@ def update_policy(
     vlm_batch: Any = None,
     vlm_loss_scale: float = 0.0,
     cp_group=None,
+    dump_step: int = -1,
 ) -> MetricsTracker:
     """
     Performs a single training step to update the policy's weights.
@@ -1212,6 +1243,20 @@ def update_policy(
     if vlm_batch is not None:
         vlm_batch = shard_vlm_batch_for_cp(vlm_batch, cp_group)
         vlm_labels_for_cp = vlm_batch["labels"].clone() if cp_group is not None else None
+
+        # Register debug hooks if dumping
+        _debug_hooks = None
+        _hook_logs = []
+        if dump_step >= 0:
+            from flagscale.train.utils.debug_hooks import DebugHooks
+
+            def _log_fn(msg):
+                _hook_logs.append(msg)
+                logger.info(msg)
+
+            _debug_hooks = DebugHooks(policy, skip_containers=True, print_fn=_log_fn)
+            _debug_hooks.register()
+
         with torch.profiler.record_function("forward_vlm"), autocast_context:
             policy.set_is_last_backward(True)
             vlm_output = policy(vlm_batch, mode="vlm")
@@ -1229,6 +1274,12 @@ def update_policy(
         with torch.profiler.record_function("backward_vlm"):
             vlm_loss_scaled.backward()
         output["vlm_loss"] = vlm_loss_for_log
+
+        # Remove hooks and dump
+        if _debug_hooks is not None:
+            _debug_hooks.remove()
+            cp_degree_val = dist.get_world_size(cp_group) if cp_group is not None else 1
+            dump_cp_tensors(dump_step, dist.get_rank(), cp_degree_val, vlm_loss_for_log, vlm_labels_for_cp, policy, _hook_logs)
 
     with torch.profiler.record_function("grad_clip"):
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -1721,6 +1772,7 @@ def main(config: TrainConfig, seed: int):
 
         with torch.profiler.record_function("update_policy"):
             update_start = time.perf_counter()
+            _dump_n = getattr(config.system, "dump_debug_steps", 0)
             train_tracker = update_policy(
                 train_tracker,
                 policy,
@@ -1732,6 +1784,7 @@ def main(config: TrainConfig, seed: int):
                 vlm_batch=vlm_batch,
                 vlm_loss_scale=getattr(config.system, "vlm_loss_scale", 0.1),
                 cp_group=cp_group,
+                dump_step=step if step < _dump_n else -1,
             )
             train_tracker.update_s = time.perf_counter() - update_start
 
