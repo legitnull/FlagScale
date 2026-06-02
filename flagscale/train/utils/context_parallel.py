@@ -192,14 +192,27 @@ def apply_context_parallel_to_model(model, cp_group):
     """Apply CP patches to both linear and full attention layers.
 
     Args:
-        model: Qwen3_5Gr00tForCausalLM model
+        model: Qwen35Gr00t policy model (wraps the VLM)
         cp_group: ProcessGroup for context parallelism
 
     Returns:
         Tuple of (linear_count, full_count) — number of patched layers
     """
-    linear_count = patch_gated_delta_net_for_cp(model, cp_group, conv1d_kernel_size=4)
-    full_count = patch_full_attention_gather_scatter(model, cp_group)
+    # Navigate to the inner language model: policy.vlm.model.model.language_model
+    # The outer `model` is Qwen35Gr00t, which has .vlm (QwenVLBackbone wrapper)
+    # .vlm.model is Qwen3_5ForConditionalGeneration
+    # .vlm.model.model.language_model is the Qwen3_5Model with layers
+    if hasattr(model, "vlm") and hasattr(model.vlm, "model"):
+        if hasattr(model.vlm.model, "model") and hasattr(model.vlm.model.model, "language_model"):
+            inner_model = model.vlm.model.model.language_model
+        else:
+            inner_model = model.vlm.model
+    else:
+        # Fallback: assume model is already the language model
+        inner_model = model
+
+    linear_count = patch_gated_delta_net_for_cp(inner_model, cp_group, conv1d_kernel_size=4)
+    full_count = patch_full_attention_gather_scatter(inner_model, cp_group)
     return linear_count, full_count
 
 
