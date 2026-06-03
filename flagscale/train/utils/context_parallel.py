@@ -11,8 +11,52 @@ import torch.nn.functional as F
 from fla.ops.cp.context import build_cp_context
 
 
+class GatherAlongSeq(torch.autograd.Function):
+    """All-gather along sequence dimension with autograd support.
+
+    Forward: all_gather [B, S_local, D] -> [B, S_total, D]
+    Backward: reduce_scatter (sum gradients across ranks, return local shard)
+    """
+
+    @staticmethod
+    def forward(ctx, input_tensor, group):
+        ctx.group = group
+        world_size = dist.get_world_size(group)
+        ctx.world_size = world_size
+
+        gathered = [torch.empty_like(input_tensor) for _ in range(world_size)]
+        dist.all_gather(gathered, input_tensor.contiguous(), group=group)
+        return torch.cat(gathered, dim=1)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        group = ctx.group
+        world_size = ctx.world_size
+
+        # reduce_scatter: sum across ranks and scatter
+        # grad_output shape: [B, S_total, D] -> split into world_size chunks
+        # Each rank gets the sum of its chunk's gradients from all ranks
+        grad_input = torch.zeros_like(grad_output.chunk(world_size, dim=1)[0])
+        grad_chunks = list(grad_output.chunk(world_size, dim=1))
+        dist.reduce_scatter(grad_input, [c.contiguous() for c in grad_chunks],
+                           op=dist.ReduceOp.SUM, group=group)
+        return grad_input, None
+
+
+def gather_along_seq(tensor, group):
+    """All-gather tensor along sequence dimension with autograd support."""
+    return GatherAlongSeq.apply(tensor, group)
+
+
 def patch_gated_delta_net_for_cp(model, cp_group, conv1d_kernel_size=4):
     """Patch GatedDeltaNet layers to use FLA's native CP.
+
+    FLA's CP splits a single sequence across ranks. For batched inputs [B, S_local, D],
+    we process each batch element independently: each is treated as one sequence of
+    S_full = S_local * world_size tokens, with this rank holding its local shard.
+
+    build_cp_context expects GLOBAL (pre-shard) cu_seqlens=[0, S_full] and partitions
+    internally, giving each rank its local portion.
 
     Args:
         model: Qwen3_5Gr00tForCausalLM model
@@ -35,84 +79,76 @@ def patch_gated_delta_net_for_cp(model, cp_group, conv1d_kernel_size=4):
 
         def make_patched_forward(attn_module, group, kernel_size):
             def patched_forward(hidden_states, cache_params=None, attention_mask=None):
-                # Build CP context for this forward pass
-                B, S_local, _ = hidden_states.shape
+                B, S_local, D = hidden_states.shape
+                world_size = dist.get_world_size(group)
+                S_full = S_local * world_size
 
-                # cu_seqlens: cumulative sequence lengths for each batch element
-                # Format: [0, S_local, 2*S_local, ..., B*S_local]
-                cu_seqlens = hidden_states.new_tensor(
-                    [b * S_local for b in range(B + 1)], dtype=torch.long
-                )
+                from transformers.models.qwen3_5.modeling_qwen3_5 import apply_mask_to_padding_states
+                from fla.modules.conv.causal_conv1d import causal_conv1d
 
+                hidden_states_masked = apply_mask_to_padding_states(hidden_states, attention_mask)
+
+                # Single-sequence global cu_seqlens — FLA partitions internally
+                cu_seqlens = hidden_states.new_tensor([0, S_full], dtype=torch.long)
                 cp_ctx = build_cp_context(
                     cu_seqlens=cu_seqlens,
                     group=group,
                     conv1d_kernel_size=kernel_size,
                 )
 
-                # Reproduce GatedDeltaNet forward with cp_context injection
-                from transformers.models.qwen3_5.modeling_qwen3_5 import apply_mask_to_padding_states
+                outputs = []
+                for b_idx in range(B):
+                    h = hidden_states_masked[b_idx:b_idx+1]  # [1, S_local, D]
 
-                hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
-                batch_size, seq_len, _ = hidden_states.shape
+                    mixed_qkv = attn_module.in_proj_qkv(h)  # [1, S_local, D_qkv]
+                    z = attn_module.in_proj_z(h)
+                    z = z.reshape(1, S_local, -1, attn_module.head_v_dim)
+                    b_proj = attn_module.in_proj_b(h)
+                    a = attn_module.in_proj_a(h)
 
-                # Project to Q/K/V
-                mixed_qkv = attn_module.in_proj_qkv(hidden_states).transpose(1, 2)
-                z = attn_module.in_proj_z(hidden_states)
-                z = z.reshape(batch_size, seq_len, -1, attn_module.head_v_dim)
-                b = attn_module.in_proj_b(hidden_states)
-                a = attn_module.in_proj_a(hidden_states)
+                    mixed_qkv = causal_conv1d(
+                        x=mixed_qkv,
+                        weight=attn_module.conv1d.weight.squeeze(1),
+                        bias=attn_module.conv1d.bias,
+                        activation=attn_module.activation,
+                        cp_context=cp_ctx,
+                    )[0]
 
-                # Conv1d with CP support (handles boundary tokens between ranks)
-                from fla.modules.conv.causal_conv1d import causal_conv1d
-                mixed_qkv = causal_conv1d(
-                    x=mixed_qkv,
-                    weight=attn_module.conv1d.weight.squeeze(1),
-                    bias=attn_module.conv1d.bias,
-                    activation=attn_module.activation,
-                    cp_context=cp_ctx,
-                )[0]  # causal_conv1d returns (output, final_state), we only need output
-
-                mixed_qkv = mixed_qkv.transpose(1, 2)
-                query, key, value = torch.split(
-                    mixed_qkv,
-                    [attn_module.key_dim, attn_module.key_dim, attn_module.value_dim],
-                    dim=-1,
-                )
-
-                query = query.reshape(batch_size, seq_len, -1, attn_module.head_k_dim)
-                key = key.reshape(batch_size, seq_len, -1, attn_module.head_k_dim)
-                value = value.reshape(batch_size, seq_len, -1, attn_module.head_v_dim)
-
-                # Compute gating
-                beta = b.sigmoid()
-                g = -attn_module.A_log.float().exp() * F.softplus(a.float() + attn_module.dt_bias)
-
-                # GQA: repeat K/Q if needed
-                if attn_module.num_v_heads // attn_module.num_k_heads > 1:
-                    query = query.repeat_interleave(
-                        attn_module.num_v_heads // attn_module.num_k_heads, dim=2
-                    )
-                    key = key.repeat_interleave(
-                        attn_module.num_v_heads // attn_module.num_k_heads, dim=2
+                    query, key, value = torch.split(
+                        mixed_qkv,
+                        [attn_module.key_dim, attn_module.key_dim, attn_module.value_dim],
+                        dim=-1,
                     )
 
-                # Call chunk_gated_delta_rule with cp_context (KEY: enables FLA CP)
-                core_attn_out, _ = attn_module.chunk_gated_delta_rule(
-                    query,
-                    key,
-                    value,
-                    g=g,
-                    beta=beta,
-                    initial_state=None,
-                    output_final_state=False,
-                    use_qk_l2norm_in_kernel=True,
-                    cp_context=cp_ctx,  # Enables inter-rank recurrent state passing
-                )
+                    query = query.reshape(1, S_local, -1, attn_module.head_k_dim)
+                    key = key.reshape(1, S_local, -1, attn_module.head_k_dim)
+                    value = value.reshape(1, S_local, -1, attn_module.head_v_dim)
 
-                # Norm and output projection
-                core_attn_out = attn_module.norm(core_attn_out, z)
-                return attn_module.out_proj(core_attn_out.reshape(batch_size, seq_len, -1))
+                    beta = b_proj.sigmoid()
+                    g = -attn_module.A_log.float().exp() * F.softplus(a.float() + attn_module.dt_bias)
+
+                    if attn_module.num_v_heads // attn_module.num_k_heads > 1:
+                        query = query.repeat_interleave(
+                            attn_module.num_v_heads // attn_module.num_k_heads, dim=2
+                        )
+                        key = key.repeat_interleave(
+                            attn_module.num_v_heads // attn_module.num_k_heads, dim=2
+                        )
+
+                    core_attn_out, _ = attn_module.chunk_gated_delta_rule(
+                        query, key, value,
+                        g=g, beta=beta,
+                        initial_state=None,
+                        output_final_state=False,
+                        use_qk_l2norm_in_kernel=True,
+                        cp_context=cp_ctx,
+                    )
+
+                    core_attn_out = attn_module.norm(core_attn_out, z)
+                    out = attn_module.out_proj(core_attn_out.reshape(1, S_local, -1))
+                    outputs.append(out)
+
+                return torch.cat(outputs, dim=0)  # [B, S_local, D]
 
             return patched_forward
 
@@ -121,6 +157,131 @@ def patch_gated_delta_net_for_cp(model, cp_group, conv1d_kernel_size=4):
 
     return patched_count
 
+
+def _warmup_triton_kernels(language_model, cp_group, conv1d_kernel_size):
+    """Run a dummy forward pass to trigger Triton autotuning.
+
+    Triton's @autotune decorator benchmarks multiple kernel configs on the first
+    call with new shapes. During benchmarking, the output buffer gets overwritten
+    by non-winning configs. This warmup ensures autotuning completes before any
+    real computation.
+    """
+    import torch.distributed as dist
+    from fla.modules.conv.causal_conv1d import causal_conv1d
+
+    layer_types = language_model.config.layer_types
+    world_size = dist.get_world_size(cp_group)
+
+    for i, layer in enumerate(language_model.layers):
+        if layer_types[i] != "linear_attention":
+            continue
+        attn_module = layer.linear_attn
+        # Use a small dummy input that matches expected shapes
+        device = next(attn_module.parameters()).device
+        dtype = next(attn_module.parameters()).dtype
+        S_local = 64  # minimal length for warmup
+        S_full = S_local * world_size
+        dummy_h = torch.zeros(1, S_local, language_model.config.hidden_size, device=device, dtype=dtype)
+
+        cu_seqlens = dummy_h.new_tensor([0, S_full], dtype=torch.long)
+        cp_ctx = build_cp_context(
+            cu_seqlens=cu_seqlens,
+            group=cp_group,
+            conv1d_kernel_size=conv1d_kernel_size,
+        )
+
+        with torch.no_grad():
+            mixed_qkv = attn_module.in_proj_qkv(dummy_h)
+            _ = causal_conv1d(
+                x=mixed_qkv,
+                weight=attn_module.conv1d.weight.squeeze(1),
+                bias=attn_module.conv1d.bias,
+                activation=attn_module.activation,
+                cp_context=cp_ctx,
+            )
+        break  # all layers share the same kernel shapes
+
+
+def _patch_gated_delta_net_no_cp(model, conv1d_kernel_size=4):
+    """Patch GatedDeltaNet layers to use FLA's kernels WITHOUT CP.
+
+    Same code path as the CP version but without any distributed communication.
+    Used as a baseline for gradient comparison tests.
+    """
+    layer_types = model.config.layer_types
+    language_model = model.language_model if hasattr(model, "language_model") else model
+
+    for i, layer in enumerate(language_model.layers):
+        if layer_types[i] != "linear_attention":
+            continue
+
+        linear_attn = layer.linear_attn
+
+        def make_patched_forward(attn_module):
+            def patched_forward(hidden_states, cache_params=None, attention_mask=None):
+                B, S, D = hidden_states.shape
+
+                from transformers.models.qwen3_5.modeling_qwen3_5 import apply_mask_to_padding_states
+                from fla.modules.conv.causal_conv1d import causal_conv1d
+
+                hidden_states_masked = apply_mask_to_padding_states(hidden_states, attention_mask)
+
+                outputs = []
+                for b_idx in range(B):
+                    h = hidden_states_masked[b_idx:b_idx+1]  # [1, S, D]
+
+                    mixed_qkv = attn_module.in_proj_qkv(h)
+                    z = attn_module.in_proj_z(h)
+                    z = z.reshape(1, S, -1, attn_module.head_v_dim)
+                    b_proj = attn_module.in_proj_b(h)
+                    a = attn_module.in_proj_a(h)
+
+                    # Use FLA's causal_conv1d WITHOUT cp_context
+                    mixed_qkv = causal_conv1d(
+                        x=mixed_qkv,
+                        weight=attn_module.conv1d.weight.squeeze(1),
+                        bias=attn_module.conv1d.bias,
+                        activation=attn_module.activation,
+                    )[0]
+
+                    query, key, value = torch.split(
+                        mixed_qkv,
+                        [attn_module.key_dim, attn_module.key_dim, attn_module.value_dim],
+                        dim=-1,
+                    )
+
+                    query = query.reshape(1, S, -1, attn_module.head_k_dim)
+                    key = key.reshape(1, S, -1, attn_module.head_k_dim)
+                    value = value.reshape(1, S, -1, attn_module.head_v_dim)
+
+                    beta = b_proj.sigmoid()
+                    g = -attn_module.A_log.float().exp() * F.softplus(a.float() + attn_module.dt_bias)
+
+                    if attn_module.num_v_heads // attn_module.num_k_heads > 1:
+                        query = query.repeat_interleave(
+                            attn_module.num_v_heads // attn_module.num_k_heads, dim=2
+                        )
+                        key = key.repeat_interleave(
+                            attn_module.num_v_heads // attn_module.num_k_heads, dim=2
+                        )
+
+                    core_attn_out, _ = attn_module.chunk_gated_delta_rule(
+                        query, key, value,
+                        g=g, beta=beta,
+                        initial_state=None,
+                        output_final_state=False,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+
+                    core_attn_out = attn_module.norm(core_attn_out, z)
+                    out = attn_module.out_proj(core_attn_out.reshape(1, S, -1))
+                    outputs.append(out)
+
+                return torch.cat(outputs, dim=0)
+
+            return patched_forward
+
+        linear_attn.forward = make_patched_forward(linear_attn)
 
 def patch_full_attention_gather_scatter(model, cp_group):
     """Apply gather/scatter to full attention layers (simpler than ring attention).
@@ -147,29 +308,22 @@ def patch_full_attention_gather_scatter(model, cp_group):
         original_forward = attn.forward
 
         def make_wrapped(orig_fwd, group):
-            def _gather_along_seq(tensor, group, world_size):
-                gathered = [torch.empty_like(tensor) for _ in range(world_size)]
-                dist.all_gather(gathered, tensor.contiguous(), group=group)
-                return torch.cat(gathered, dim=1)
-
             def wrapped(hidden_states, position_embeddings=None, attention_mask=None, **kwargs):
                 world_size = dist.get_world_size(group)
                 rank = dist.get_rank(group)
 
-                # All-gather hidden_states: [B, S/N, H] -> [B, S, H]
-                full_hidden = _gather_along_seq(hidden_states, group, world_size)
+                # All-gather hidden_states: [B, S/N, H] -> [B, S, H] (differentiable)
+                full_hidden = gather_along_seq(hidden_states, group)
 
                 # All-gather position_embeddings (cos, sin): [B, S/N, D] -> [B, S, D]
+                # Position embeddings don't need gradients
                 full_pos_emb = None
                 if position_embeddings is not None:
                     cos, sin = position_embeddings
-                    full_cos = _gather_along_seq(cos, group, world_size)
-                    full_sin = _gather_along_seq(sin, group, world_size)
+                    full_cos = gather_along_seq(cos.detach(), group)
+                    full_sin = gather_along_seq(sin.detach(), group)
                     full_pos_emb = (full_cos, full_sin)
 
-                # Pass attention_mask=None since we gathered to full sequence length
-                # and the attention layer uses is_causal=True for training (FlashAttention
-                # applies causal masking internally)
                 output = orig_fwd(full_hidden, full_pos_emb, attention_mask=None, **kwargs)
 
                 if isinstance(output, tuple):
