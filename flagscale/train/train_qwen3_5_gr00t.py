@@ -65,11 +65,23 @@ from flagscale.train.utils.logging_utils import (
     format_big_number,
 )
 from flagscale.train.utils.optim_setup import setup_optimizer_and_scheduler
-from flagscale.train.utils.context_parallel import (
-    apply_context_parallel_to_model,
-    compute_cp_corrected_loss,
-    patch_qwen3_5_model_for_vlm_cp,
-    shard_vlm_batch_for_cp,
+from flagscale.train.utils.parallel_state import get_parallel_state, ParallelState
+from flagscale.train.utils.sequence_parallel import (
+    init_sequence_parallel,
+    get_ulysses_sequence_parallel_group,
+    get_ulysses_sequence_parallel_world_size,
+    gather_outputs,
+    slice_input_tensor,
+    sp_pad_and_slice,
+)
+from flagscale.train.utils.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
+from flagscale.train.utils.sequence_parallel.loss import reduce_sequence_parallel_loss
+from flagscale.train.utils.bind_ops import bind_qwen3_5_fla_ops
+from flagscale.train.utils.ulysses_sp_helpers import (
+    apply_ulysses_sp_to_model,
+    compute_ulysses_sp_corrected_loss,
+    patch_qwen3_5_model_for_vlm_ulysses_sp,
+    shard_vlm_batch_for_ulysses_sp,
 )
 from flagscale.train.utils.train_utils import (
     StatefulDistributedSampler,
@@ -1242,7 +1254,7 @@ def update_policy(
             output[key] = torch.stack([value.detach() for value in values]).mean()
 
     if vlm_batch is not None:
-        vlm_batch = shard_vlm_batch_for_cp(vlm_batch, cp_group)
+        vlm_batch = shard_vlm_batch_for_ulysses_sp(vlm_batch, cp_group)
         vlm_labels_for_cp = vlm_batch["labels"].clone() if cp_group is not None else None
 
         # Register debug hooks if dumping
@@ -1264,7 +1276,7 @@ def update_policy(
             vlm_loss = vlm_output["vlm_loss"]
             if cp_group is not None:
                 shift_labels = vlm_labels_for_cp[:, 1:]
-                vlm_loss_for_backward, vlm_loss_for_log = compute_cp_corrected_loss(
+                vlm_loss_for_backward, vlm_loss_for_log = compute_ulysses_sp_corrected_loss(
                     vlm_loss, shift_labels, cp_group
                 )
             else:
@@ -1349,6 +1361,8 @@ def main(config: TrainConfig, seed: int):
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     is_main_process = rank == 0
+
+    bind_qwen3_5_fla_ops()
 
     if config.data.dataset_type == "wds":
         from megatron.energon import WorkerConfig, get_loader, get_train_dataset
@@ -1516,9 +1530,11 @@ def main(config: TrainConfig, seed: int):
         dp_mesh = device_mesh["dp"]
         cp_mesh = device_mesh["cp"]
         cp_group = cp_mesh.get_group()
-        apply_context_parallel_to_model(policy, cp_group)
-        patch_qwen3_5_model_for_vlm_cp(policy.vlm.model, cp_group)
-        logger.info(f"Context parallelism enabled: cp_degree={cp_degree}, dp_degree={dp_degree}")
+        # Initialize Ulysses SP state so the patched model picks up ulysses_enabled=True
+        init_sequence_parallel(ulysses_size=cp_degree, sep_dp=True)
+        apply_ulysses_sp_to_model(policy, cp_group)
+        patch_qwen3_5_model_for_vlm_ulysses_sp(policy.vlm.model, cp_group)
+        logger.info(f"Ulysses sequence parallelism enabled: sp_degree={cp_degree}, dp_degree={dp_degree}")
     else:
         dp_mesh = init_device_mesh(get_platform().name(), (world_size,))
         cp_group = None
