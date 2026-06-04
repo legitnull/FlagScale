@@ -68,6 +68,7 @@ from flagscale.train.utils.optim_setup import setup_optimizer_and_scheduler
 from flagscale.train.utils.context_parallel import (
     apply_context_parallel_to_model,
     compute_cp_corrected_loss,
+    patch_qwen3_5_model_for_vlm_cp,
     shard_vlm_batch_for_cp,
 )
 from flagscale.train.utils.train_utils import (
@@ -1516,6 +1517,7 @@ def main(config: TrainConfig, seed: int):
         cp_mesh = device_mesh["cp"]
         cp_group = cp_mesh.get_group()
         apply_context_parallel_to_model(policy, cp_group)
+        patch_qwen3_5_model_for_vlm_cp(policy.vlm.model, cp_group)
         logger.info(f"Context parallelism enabled: cp_degree={cp_degree}, dp_degree={dp_degree}")
     else:
         dp_mesh = init_device_mesh(get_platform().name(), (world_size,))

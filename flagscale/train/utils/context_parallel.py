@@ -370,10 +370,141 @@ def apply_context_parallel_to_model(model, cp_group):
     return linear_count, full_count
 
 
-def shard_vlm_batch_for_cp(vlm_batch, cp_group):
-    """Shard VLM batch inputs along the sequence dimension for CP.
+def patch_qwen3_5_model_for_vlm_cp(model, cp_group):
+    """Patch Qwen3_5ForConditionalGeneration to shard after vision merge.
 
-    Handles both 2D tensors [B, S] and 3D position_ids [3 or 4, B, S] for MRoPE.
+    This allows CP to work with multimodal inputs by:
+    1. Processing vision features on full input_ids (no sharding yet)
+    2. After vision merge into inputs_embeds, shard along sequence dim
+    3. Run language model on sharded inputs_embeds
+    4. Return sharded hidden_states (no gather — caller handles loss on local shard)
+
+    Args:
+        model: Qwen3_5ForConditionalGeneration instance (policy.vlm.model)
+        cp_group: ProcessGroup for context parallelism
+    """
+    if cp_group is None:
+        return
+
+    rank = dist.get_rank(cp_group)
+    world_size = dist.get_world_size(cp_group)
+
+    # Navigate to Qwen3_5Model (model.model for ForConditionalGeneration)
+    if hasattr(model, 'model') and hasattr(model.model, 'language_model'):
+        qwen_model = model.model
+    else:
+        qwen_model = model
+
+    original_forward = qwen_model.forward
+
+    def patched_forward(
+        input_ids=None,
+        pixel_values=None,
+        pixel_values_videos=None,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        mm_token_type_ids=None,
+        **kwargs
+    ):
+        if inputs_embeds is None:
+            inputs_embeds = qwen_model.get_input_embeddings()(input_ids)
+
+        if pixel_values is not None:
+            image_outputs = qwen_model.get_image_features(
+                pixel_values, image_grid_thw, return_dict=True
+            )
+            image_embeds = image_outputs.pooler_output
+            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            image_mask, _ = qwen_model.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+        if pixel_values_videos is not None:
+            video_outputs = qwen_model.get_video_features(
+                pixel_values_videos, video_grid_thw, return_dict=True
+            )
+            video_embeds = video_outputs.pooler_output
+            video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            _, video_mask = qwen_model.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+
+        if position_ids is None:
+            position_ids = qwen_model.compute_3d_position_ids(
+                input_ids=input_ids,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                mm_token_type_ids=mm_token_type_ids,
+            )
+
+        # Fallback: if position_ids is still None, generate sequential IDs
+        # so each CP rank gets correctly offset positions after sharding.
+        if position_ids is None:
+            seq_len_pos = inputs_embeds.shape[1]
+            batch_size = inputs_embeds.shape[0]
+            position_ids = torch.arange(seq_len_pos, device=inputs_embeds.device)
+            position_ids = position_ids.view(1, 1, -1).expand(4, batch_size, -1)
+
+        # Shard along sequence dim for CP
+        seq_len = inputs_embeds.shape[1]
+        pad_len = 0
+        if seq_len % world_size != 0:
+            pad_len = world_size - (seq_len % world_size)
+            inputs_embeds = F.pad(inputs_embeds, (0, 0, 0, pad_len), value=0.0)
+            if attention_mask is not None:
+                attention_mask = F.pad(attention_mask, (0, pad_len), value=0)
+            if position_ids is not None:
+                if position_ids.ndim == 3:
+                    position_ids = F.pad(position_ids, (0, pad_len), value=0)
+                else:
+                    position_ids = F.pad(position_ids, (0, pad_len), value=0)
+
+        local_inputs_embeds = inputs_embeds.chunk(world_size, dim=1)[rank].contiguous()
+        local_attention_mask = attention_mask.chunk(world_size, dim=1)[rank].contiguous() if attention_mask is not None else None
+        if position_ids is not None:
+            if position_ids.ndim == 3:
+                local_position_ids = position_ids.chunk(world_size, dim=2)[rank].contiguous()
+            else:
+                local_position_ids = position_ids.chunk(world_size, dim=1)[rank].contiguous()
+        else:
+            local_position_ids = None
+
+        outputs = qwen_model.language_model(
+            input_ids=None,
+            position_ids=local_position_ids,
+            attention_mask=local_attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=local_inputs_embeds,
+            **kwargs,
+        )
+
+        # Return sharded hidden_states — caller handles lm_head + loss on local shard
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ModelOutputWithPast
+        return Qwen3_5ModelOutputWithPast(
+            last_hidden_state=outputs[0],
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            rope_deltas=qwen_model.rope_deltas,
+        )
+
+    qwen_model.forward = patched_forward
+
+
+def shard_vlm_batch_for_cp(vlm_batch, cp_group):
+    """Shard VLM batch labels along the sequence dimension for CP.
+
+    With the patched Qwen3_5Model forward, inputs_embeds are sharded internally
+    after vision merge. Only labels need external sharding to match the local logits.
 
     Args:
         vlm_batch: Dict with input_ids, attention_mask, labels, position_ids, etc.
@@ -388,34 +519,14 @@ def shard_vlm_batch_for_cp(vlm_batch, cp_group):
     rank = dist.get_rank(cp_group)
     world_size = dist.get_world_size(cp_group)
 
-    seq_keys = ["input_ids", "attention_mask", "labels", "position_ids", "mm_token_type_ids"]
-    for key in seq_keys:
-        if key in vlm_batch and vlm_batch[key] is not None:
-            tensor = vlm_batch[key]
-
-            # Handle 3D position_ids [3 or 4, B, S] for MRoPE
-            if key == "position_ids" and tensor.ndim == 3:
-                seq_dim = 2
-                seq_len = tensor.shape[seq_dim]
-            else:
-                seq_dim = 1
-                seq_len = tensor.shape[seq_dim]
-
-            if seq_len % world_size != 0:
-                pad_len = world_size - (seq_len % world_size)
-                if key == "labels":
-                    pad_value = -100
-                elif key == "attention_mask":
-                    pad_value = 0
-                else:
-                    pad_value = 0
-
-                if seq_dim == 1:
-                    tensor = F.pad(tensor, (0, pad_len), value=pad_value)
-                else:  # seq_dim == 2 for 3D position_ids
-                    tensor = F.pad(tensor, (0, pad_len), value=pad_value)
-
-            vlm_batch[key] = tensor.chunk(world_size, dim=seq_dim)[rank].contiguous()
+    # Only shard labels — the model forward handles input sharding after vision merge
+    if "labels" in vlm_batch and vlm_batch["labels"] is not None:
+        labels = vlm_batch["labels"]
+        seq_len = labels.shape[1]
+        if seq_len % world_size != 0:
+            pad_len = world_size - (seq_len % world_size)
+            labels = F.pad(labels, (0, pad_len), value=-100)
+        vlm_batch["labels"] = labels.chunk(world_size, dim=1)[rank].contiguous()
 
     return vlm_batch
 
