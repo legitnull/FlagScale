@@ -27,7 +27,6 @@ from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
     get_optimizer_state_dict,
 )
-from torch.distributed.device_mesh import init_device_mesh
 from torch.optim import Optimizer
 from torchdata.stateful_dataloader import StatefulDataLoader
 
@@ -65,17 +64,7 @@ from flagscale.train.utils.logging_utils import (
     format_big_number,
 )
 from flagscale.train.utils.optim_setup import setup_optimizer_and_scheduler
-from flagscale.train.utils.parallel_state import get_parallel_state, ParallelState
-from flagscale.train.utils.sequence_parallel import (
-    init_sequence_parallel,
-    get_ulysses_sequence_parallel_group,
-    get_ulysses_sequence_parallel_world_size,
-    gather_outputs,
-    slice_input_tensor,
-    sp_pad_and_slice,
-)
-from flagscale.train.utils.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
-from flagscale.train.utils.sequence_parallel.loss import reduce_sequence_parallel_loss
+from flagscale.train.utils.parallel_state import get_parallel_state, init_parallel_state, ParallelState
 from flagscale.train.utils.bind_ops import bind_qwen3_5_fla_ops
 from flagscale.train.utils.ulysses_sp_helpers import (
     apply_ulysses_sp_to_model,
@@ -1191,7 +1180,8 @@ def update_policy(
     lock=None,
     vlm_batch: Any = None,
     vlm_loss_scale: float = 0.0,
-    cp_group=None,
+    ulysses_group=None,
+    sp_grad_scale: float = 1.0,
     dump_step: int = -1,
 ) -> MetricsTracker:
     """
@@ -1236,7 +1226,7 @@ def update_policy(
             with autocast_context:
                 micro_output = policy(vla_batch)
                 vla_outputs.append(micro_output)
-                vla_loss = micro_output["loss"] / len(vla_batches)
+                vla_loss = micro_output["loss"] / len(vla_batches) * sp_grad_scale
 
         with torch.profiler.record_function("backward_vla"):
             if hasattr(policy, "set_is_last_backward"):
@@ -1254,8 +1244,8 @@ def update_policy(
             output[key] = torch.stack([value.detach() for value in values]).mean()
 
     if vlm_batch is not None:
-        vlm_batch = shard_vlm_batch_for_ulysses_sp(vlm_batch, cp_group)
-        vlm_labels_for_cp = vlm_batch["labels"].clone() if cp_group is not None else None
+        vlm_batch, global_valid_tokens = shard_vlm_batch_for_ulysses_sp(vlm_batch, ulysses_group)
+        vlm_labels_for_cp = vlm_batch["labels"].clone() if ulysses_group is not None else None
 
         # Register debug hooks if dumping
         _debug_hooks = None
@@ -1274,24 +1264,26 @@ def update_policy(
             policy.set_is_last_backward(True)
             vlm_output = policy(vlm_batch, mode="vlm")
             vlm_loss = vlm_output["vlm_loss"]
-            if cp_group is not None:
+            if ulysses_group is not None:
                 shift_labels = vlm_labels_for_cp[:, 1:]
                 vlm_loss_for_backward, vlm_loss_for_log = compute_ulysses_sp_corrected_loss(
-                    vlm_loss, shift_labels, cp_group
+                    vlm_loss, shift_labels, global_valid_tokens
                 )
             else:
                 vlm_loss_for_backward = vlm_loss
                 vlm_loss_for_log = vlm_loss
-            vlm_loss_scaled = vlm_loss_scale * vlm_loss_for_backward
+            vlm_loss_scaled = vlm_loss_scale * vlm_loss_for_backward * sp_grad_scale
 
         with torch.profiler.record_function("backward_vlm"):
             vlm_loss_scaled.backward()
+        if ulysses_group is not None:
+            dist.all_reduce(vlm_loss_for_log, op=dist.ReduceOp.SUM, group=ulysses_group)
         output["vlm_loss"] = vlm_loss_for_log
 
         # Remove hooks and dump
         if _debug_hooks is not None:
             _debug_hooks.remove()
-            cp_degree_val = dist.get_world_size(cp_group) if cp_group is not None else 1
+            cp_degree_val = dist.get_world_size(ulysses_group) if ulysses_group is not None else 1
             dump_cp_tensors(dump_step, dist.get_rank(), cp_degree_val, vlm_loss_for_log, vlm_labels_for_cp, policy, _hook_logs)
 
     with torch.profiler.record_function("grad_clip"):
@@ -1519,26 +1511,17 @@ def main(config: TrainConfig, seed: int):
     )
 
     # --- Apply FSDP2 ---
-    if cp_degree > 1:
-        assert world_size % cp_degree == 0, (
-            f"world_size ({world_size}) must be divisible by cp_degree ({cp_degree})"
-        )
-        dp_degree = world_size // cp_degree
-        device_mesh = init_device_mesh(
-            get_platform().name(), (dp_degree, cp_degree), mesh_dim_names=("dp", "cp")
-        )
-        dp_mesh = device_mesh["dp"]
-        cp_mesh = device_mesh["cp"]
-        cp_group = cp_mesh.get_group()
-        # Initialize Ulysses SP state so the patched model picks up ulysses_enabled=True
-        init_sequence_parallel(ulysses_size=cp_degree, sep_dp=True)
-        apply_ulysses_sp_to_model(policy, cp_group)
-        patch_qwen3_5_model_for_vlm_ulysses_sp(policy.vlm.model, cp_group)
-        logger.info(f"Ulysses sequence parallelism enabled: sp_degree={cp_degree}, dp_degree={dp_degree}")
-    else:
-        dp_mesh = init_device_mesh(get_platform().name(), (world_size,))
-        cp_group = None
-    apply_fsdp2(policy, dp_mesh)
+    ulysses_degree = getattr(config.system, "context_parallel_degree", 1)
+    dp_degree = world_size // ulysses_degree
+    init_parallel_state(dp_size=dp_degree, dp_shard_size=dp_degree, ulysses_size=ulysses_degree)
+    ps = get_parallel_state()
+    fsdp_mesh = ps.fsdp_mesh
+    ulysses_group = ps.ulysses_group if ulysses_degree > 1 else None
+    if ulysses_degree > 1:
+        apply_ulysses_sp_to_model(policy, ulysses_group)
+        patch_qwen3_5_model_for_vlm_ulysses_sp(policy.vlm.model, ulysses_group)
+        logger.info(f"Ulysses sequence parallelism enabled: sp_degree={ulysses_degree}, dp_degree={dp_degree}")
+    apply_fsdp2(policy, fsdp_mesh)
 
     # Setup optimizer and scheduler (applies freeze config internally)
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(policy, config)
@@ -1801,7 +1784,8 @@ def main(config: TrainConfig, seed: int):
                 lr_scheduler=lr_scheduler,
                 vlm_batch=vlm_batch,
                 vlm_loss_scale=getattr(config.system, "vlm_loss_scale", 0.1),
-                cp_group=cp_group,
+                ulysses_group=ulysses_group,
+                sp_grad_scale=float(ulysses_degree),
                 dump_step=step if step < _dump_n else -1,
             )
             train_tracker.update_s = time.perf_counter() - update_start

@@ -49,6 +49,7 @@
 # ==============================================================================
 
 import itertools
+import os
 from collections.abc import Callable
 
 # Additional imports for patches
@@ -941,6 +942,14 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
+# ======================================================================
+# [MODIFIED CLASS] Qwen3_5Attention
+# Methods patched: forward
+#   Modification: Ulysses SP for full_attention layers
+#     - gather_seq_scatter_heads on Q/K/V and gate before attention
+#     - all-gather position embeddings (cos/sin) for full sequence RoPE
+#     - gather_heads_scatter_seq on attention output
+# ======================================================================
 @use_kernelized_func(apply_rotary_pos_emb)
 class Qwen3_5Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -985,11 +994,36 @@ class Qwen3_5Attention(nn.Module):
         )
         gate = gate.reshape(*input_shape, -1)
 
-        query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        query_states = self.q_norm(query_states.view(hidden_shape))
+        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape))
+        value_states = self.v_proj(hidden_states).view(hidden_shape)
+
+        # Modification: Ulysses SP for full attention layers — gather full sequence, scatter heads.
+        ulysses_enabled = get_parallel_state().ulysses_enabled
+        if ulysses_enabled:
+            ulysses_group = get_parallel_state().ulysses_group
+            ulysses_size = get_parallel_state().ulysses_size
+            assert self.config.num_attention_heads % ulysses_size == 0
+            assert self.config.num_key_value_heads % ulysses_size == 0
+
+            # query_states: [B, S_local, num_q_heads, head_dim] -> [B, S_full, local_q_heads, head_dim]
+            query_states = gather_seq_scatter_heads(query_states, seq_dim=1, head_dim=2, group=ulysses_group)
+            key_states = gather_seq_scatter_heads(key_states, seq_dim=1, head_dim=2, group=ulysses_group)
+            value_states = gather_seq_scatter_heads(value_states, seq_dim=1, head_dim=2, group=ulysses_group)
+
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
 
         cos, sin = position_embeddings
+        if ulysses_enabled:
+            # All-gather position embeddings to match the gathered full sequence length.
+            cos_chunks = [torch.empty_like(cos) for _ in range(ulysses_size)]
+            sin_chunks = [torch.empty_like(sin) for _ in range(ulysses_size)]
+            dist.all_gather(cos_chunks, cos.contiguous(), group=ulysses_group)
+            dist.all_gather(sin_chunks, sin.contiguous(), group=ulysses_group)
+            cos = torch.cat(cos_chunks, dim=1)
+            sin = torch.cat(sin_chunks, dim=1)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
@@ -998,6 +1032,14 @@ class Qwen3_5Attention(nn.Module):
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
         )
+
+        # Modification: rebuild causal mask for the full gathered sequence under Ulysses SP.
+        if ulysses_enabled and attention_mask is not None:
+            full_seq_len = query_states.shape[2]
+            attention_mask = torch.full(
+                (full_seq_len, full_seq_len), float("-inf"),
+                device=query_states.device, dtype=query_states.dtype,
+            ).triu(1)[None, None, :, :]
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -1010,7 +1052,15 @@ class Qwen3_5Attention(nn.Module):
             **kwargs,
         )
 
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        if ulysses_enabled:
+            # attn_output: [B, local_q_heads, S_full, head_dim] -> [B, S_full, local_q_heads, head_dim]
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            # gather heads, scatter seq -> [B, S_local, num_q_heads, head_dim]
+            attn_output = gather_heads_scatter_seq(attn_output, head_dim=2, seq_dim=1, group=ulysses_group)
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        else:
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+
         attn_output = attn_output * torch.sigmoid(gate)
 
         attn_output = self.o_proj(attn_output)
@@ -1101,12 +1151,9 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
 
         hidden_states = self.input_layernorm(hidden_states)
 
-        # Modification: read varlen metadata from kwargs and enforce it for linear-attention varlen kernels.
+        # Modification: read varlen metadata from kwargs. For non-varlen (unpacked) training,
+        # cu_seq_lens_q can be None and the kernels will use standard non-varlen paths.
         cu_seq_lens_q = kwargs.get("cu_seq_lens_q", None)
-        assert cu_seq_lens_q is not None, (
-            "cu_seq_lens_q must be provided to support varlen Flash Linear Attention, varlen Conv1D,"
-            "and to remove the full Flash Attention CPU-GPU sync."
-        )
 
         # Token Mixer
         if self.layer_type == "linear_attention":
@@ -1652,6 +1699,18 @@ class Qwen3_5VisionModel(Qwen3_5PreTrainedModel):
                 cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
             # --- Patch.4 ---
 
+            # --- Patch.4b: Replace cu_seqlens with local boundaries for SP ---
+            # After sp_pad_and_slice, hidden_states is local (seq_len tokens). The
+            # global cu_seqlens (summing to total_seq_len) is incompatible with both
+            # FA varlen (expects cu_seqlens[-1] == tensor length) and the split-based
+            # non-FA path. Since ViT attention is bidirectional, treating the entire
+            # local shard as one sequence is correct — all local tokens attend to each
+            # other regardless of original image boundaries.
+            cu_seqlens = torch.tensor(
+                [0, seq_len], dtype=torch.int32, device=hidden_states.device
+            )
+            # --- Patch.4b ---
+
         # --- Patch.5: Pre-compute max_seqlen once on the host ---
         # `flash_attn_varlen_func` expects `max_seqlen_q/k` as Python ints; passing
         # a 0-D GPU tensor forces an `.item()` inside the C++ binding. The HF body
@@ -1673,7 +1732,10 @@ class Qwen3_5VisionModel(Qwen3_5PreTrainedModel):
         #       and sdpa paths in the consumer pop+discard the kwarg, so the
         #       host sync would be wasted.
         if _VEOMNI_VISION_ATTENTION_PATCHED and is_flash_attention_requested(self.config):
-            if precomputed_max_seqlen is not None:
+            if get_parallel_state().sp_enabled:
+                # Patch.4b set cu_seqlens = [0, seq_len]; max_seqlen matches.
+                kwargs["vision_max_seqlen"] = seq_len
+            elif precomputed_max_seqlen is not None:
                 # Collator-side max already accounts for sp-pad; use as-is.
                 kwargs["vision_max_seqlen"] = precomputed_max_seqlen
             else:
@@ -1701,28 +1763,32 @@ class Qwen3_5VisionModel(Qwen3_5PreTrainedModel):
         # Run a fake ViT forward so every FSDP rank touches the vision tower.
         # This prevents reduce-scatter hangs when some ranks have no real images/videos.
         """
-        # 16 patch tokens, each flattened from 3 channels * 2 temporal * 16 * 16 spatial.
-        pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
         if get_parallel_state().sp_enabled:
+            sp_size = get_parallel_state().sp_size
             # grid_thw describes the *global* pre-sharded vision grid (H scaled by
             # sp_size): total patch tokens = 1 * (4 * sp_size) * 4 = 16 * sp_size.
-            t, h, w = 1, 4 * get_parallel_state().sp_size, 4
+            # pixel_values is the LOCAL shard: 16 tokens (global / sp_size).
+            t, h, w = 1, 4 * sp_size, 4
+            local_tokens = (t * h * w) // sp_size
+            local_frame_len = (h * w) // sp_size
         else:
             # Non-SP case: a minimal valid 4x4 patch grid (1 * 4 * 4 = 16 tokens).
             t, h, w = 1, 4, 4
+            local_tokens = 16
+            local_frame_len = h * w
+        pixel_values = torch.zeros((local_tokens, 3 * 2 * 16 * 16), dtype=self.dtype, device=self.device)
         grid_thw = torch.tensor([[t, h, w]], dtype=torch.int32, device=self.device)
 
-        # Precompute the ViT metadata host-side and pass it straight to forward:
-        # dummy_forward runs inside Model.forward, so the collator can't precompute
-        # it — but t / h / w are Python ints here, so the dummy ViT forward skips
-        # the `grid_thw.tolist()` + cu_seqlens build it would otherwise sync on.
+        # Precompute the ViT metadata host-side and pass it straight to forward.
+        # cu_seqlens must reflect the LOCAL (post-SP-shard) sequence lengths so that
+        # the non-FA attention path can split the local tensor correctly.
         cu = [0]
         for _ in range(t):
-            cu.append(cu[-1] + h * w)
+            cu.append(cu[-1] + local_frame_len)
         vit_metadata = {
             "grid_thw_list": [[t, h, w]],
             "cu_seqlens": torch.tensor(cu, dtype=torch.int32, device="cpu"),
-            "max_seqlen": h * w,
+            "max_seqlen": local_frame_len,
         }
         return self(hidden_states=pixel_values, grid_thw=grid_thw, vit_metadata=vit_metadata)
 
@@ -1894,6 +1960,12 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def get_input_embeddings(self):
+        return self.language_model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.language_model.embed_tokens = value
 
     def get_vision_position_ids(
         self,
@@ -2187,6 +2259,10 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
+        # When vision tokens are replicated (not sharded) across SP ranks,
+        # bypass ViT-level SP gather/scatter to preserve correct self-attention.
+        sp_vision_replicated = kwargs.pop("sp_vision_replicated", False)
+
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -2205,8 +2281,10 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
             if get_parallel_state().sp_enabled:
                 input_ids_list = [torch.zeros_like(input_ids) for i in range(get_parallel_state().sp_size)]
                 dist.all_gather(input_ids_list, input_ids, group=get_parallel_state().sp_group)
-                input_ids = torch.cat(input_ids_list, dim=0)
-            image_mask, video_mask = self.get_placeholder_mask(input_ids)
+                input_ids_for_mask = torch.cat(input_ids_list, dim=1)
+            else:
+                input_ids_for_mask = input_ids
+            image_mask, video_mask = self.get_placeholder_mask(input_ids_for_mask)
         # --- Patch.1 ---
 
         # --- Patch.4: Pop pre-computed Flash Attention kwargs to avoid ViT forward re-computation ---
@@ -2249,24 +2327,32 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
         # --- Patch.1 ---
 
         if pixel_values is not None:
+            # When vision is replicated, temporarily disable SP inside the ViT so
+            # it processes all patches with correct global self-attention.
+            _ps = get_parallel_state()
+            if sp_vision_replicated:
+                object.__setattr__(_ps, 'ulysses_size', 1)
             image_outputs: BaseModelOutputWithPooling = self.get_image_features(
                 pixel_values, image_grid_thw, return_dict=True, **image_vit_kwargs
             )
+            if sp_vision_replicated:
+                object.__setattr__(_ps, 'ulysses_size', dist.get_world_size(_ps.sp_group))
             image_embeds = image_outputs.pooler_output
 
             # --- Patch.1: Shard image_embeds for sequence parallel scatter ---
-            if get_parallel_state().sp_enabled:
+            if get_parallel_state().sp_enabled and not sp_vision_replicated:
                 # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
                 image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
             embeds_image_mask = (
                 image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
             )
-            # `masked_scatter` consumes exactly `image_mask.sum()` elements from `image_embeds`, taking the
-            # leading rows in order — image-placeholder positions in `input_ids` are laid out in the same
-            # order as their vision tokens, and the data collator pads the vision sequence only at the
-            # *end*. So any padded vision rows are trailing and simply go unused; no `image_embeds[:n]`
-            # slice is needed, which also removes the `image_mask.sum().item()` host-device sync.
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            # DEBUG: checkpoint image_embeds before scatter
+            if os.environ.get("DEBUG_SP_EMBEDS"):
+                _rank = dist.get_rank() if dist.is_initialized() else 0
+                if _rank == 0:
+                    print(f"  [DBG rank0] image_embeds shape={image_embeds.shape} norm={image_embeds.float().norm().item():.4f} mean={image_embeds.float().mean().item():.6f}", flush=True)
+                    print(f"  [DBG rank0] image_mask sum={image_mask.sum().item()} inputs_embeds_pre_scatter norm={inputs_embeds.float().norm().item():.4f}", flush=True)
             inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_embeds)
 
             # sequence parallel patch for image_mask
@@ -2291,22 +2377,23 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
             # --- Patch.2 ---
 
         if pixel_values_videos is not None:
+            _ps = get_parallel_state()
+            if sp_vision_replicated:
+                object.__setattr__(_ps, 'ulysses_size', 1)
             video_outputs: BaseModelOutputWithPooling = self.get_video_features(
                 pixel_values_videos, video_grid_thw, return_dict=True, **video_vit_kwargs
             )
+            if sp_vision_replicated:
+                object.__setattr__(_ps, 'ulysses_size', dist.get_world_size(_ps.sp_group))
             video_embeds = video_outputs.pooler_output
 
             # --- Patch.1: Shard video_embeds for sequence parallel scatter ---
-            # sequence parallel patch for video embeds
-            if get_parallel_state().sp_enabled:
+            if get_parallel_state().sp_enabled and not sp_vision_replicated:
                 # (seq_len // sp_size, hidden_size) to  (seq_len, hidden_size // sp_size)
                 video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
             embeds_video_mask = (
                 video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
             )
-            # As with `image_embeds` above: `masked_scatter` uses exactly `video_mask.sum()` leading rows,
-            # any collator-padded vision rows are trailing and unused — no `video_embeds[:n]` slice (and no
-            # `video_mask.sum().item()` host-device sync) needed.
             video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(embeds_video_mask, video_embeds)
 
@@ -2333,10 +2420,21 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
 
         # --- Patch.1: Final transpose back to standard sequence-sharded layout ---
         if get_parallel_state().sp_enabled:
+            # DEBUG: checkpoint full inputs_embeds before slice
+            if os.environ.get("DEBUG_SP_EMBEDS"):
+                _rank = dist.get_rank() if dist.is_initialized() else 0
+                if _rank == 0:
+                    print(f"  [DBG rank0] pre-slice inputs_embeds shape={inputs_embeds.shape} norm={inputs_embeds.float().norm().item():.4f} mean={inputs_embeds.float().mean().item():.6f}", flush=True)
             # Restore the layout to (batch, local_seq, full_hidden) for subsequent
             # transformer layers, which expect standard Sequence Parallel sharding.
             inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
         # --- Patch.1 ---
+
+        # DEBUG: checkpoint inputs_embeds before LLM
+        if os.environ.get("DEBUG_SP_EMBEDS"):
+            _rank = dist.get_rank() if dist.is_initialized() else 0
+            if _rank == 0:
+                print(f"  [DBG rank0] inputs_embeds shape={inputs_embeds.shape} norm={inputs_embeds.float().norm().item():.4f} mean={inputs_embeds.float().mean().item():.6f}", flush=True)
 
         if position_ids is None:
             # v5 `compute_3d_position_ids` gates M-RoPE on `mm_token_type_ids`
@@ -2483,18 +2581,12 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
                 )
             else:
                 logits = self.lm_head(hidden_states)
-                loss, _, fused_linear_aux = self.loss_function(
+                loss = self.loss_function(
                     logits=logits,
                     labels=labels,
                     vocab_size=self.config.vocab_size,
-                    hidden_states=hidden_states,
-                    weights=self.lm_head.weight,
                     **kwargs,
                 )
-                if fused_linear_aux is not None:
-                    # fused_linear_aux path empties loss/logits slots; clear the local 3D
-                    # logits so output mirrors the OpSlot branch's contract.
-                    logits = None
         else:
             logits = self.lm_head(hidden_states)
 
@@ -2671,18 +2763,13 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
                 )
             else:
                 logits = self.lm_head(hidden_states)
-                loss, _, fused_linear_aux = self.loss_function(
+                loss = self.loss_function(
                     logits=logits,
                     labels=labels,
                     vocab_size=self.config.text_config.vocab_size,
-                    hidden_states=hidden_states,
-                    weights=self.lm_head.weight,
                     **kwargs,
                 )
-                if fused_linear_aux is not None:
-                    # fused_linear_aux path empties loss/logits slots; clear the local 3D
-                    # logits so output mirrors the OpSlot branch's contract.
-                    logits = None
+                fused_linear_aux = None
         else:
             logits = self.lm_head(hidden_states)
 

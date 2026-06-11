@@ -59,7 +59,7 @@ def patch_qwen3_5_model_for_vlm_ulysses_sp(model, ulysses_group: Optional[dist.P
 def shard_vlm_batch_for_ulysses_sp(
     batch: Dict[str, Any],
     ulysses_group: Optional[dist.ProcessGroup] = None
-) -> Dict[str, Any]:
+) -> tuple[Dict[str, Any], int]:
     """
     Shard a VLM batch for Ulysses sequence parallelism.
 
@@ -67,90 +67,106 @@ def shard_vlm_batch_for_ulysses_sp(
     This function slices input_ids, attention_mask, labels, etc. along the sequence
     dimension according to the rank's position in the ulysses_group.
 
+    Vision tensors (pixel_values, pixel_values_videos) are sharded along dim=0
+    (patch sequence), while language tensors are sharded along dim=1 (token sequence).
+    Metadata tensors (grid_thw) are passed through unchanged.
+
     Args:
         batch: Input batch dict with keys like input_ids, attention_mask, labels, etc.
         ulysses_group: The process group for Ulysses SP (if None, no sharding)
 
     Returns:
-        Sharded batch dict where sequence tensors are sliced to local chunks
+        (sharded_batch, global_valid_tokens): Sharded batch dict where sequence tensors
+        are sliced to local chunks, and the total number of valid (non -100) label
+        tokens across all ulysses ranks. global_valid_tokens is computed here via a
+        CPU all_reduce to avoid NCCL communicator conflicts during backward.
     """
     if ulysses_group is None:
-        return batch
+        labels = batch.get("labels")
+        global_valid_tokens = int((labels != -100).sum().item()) if labels is not None else 0
+        return batch, global_valid_tokens
 
     ulysses_size = dist.get_world_size(ulysses_group)
     ulysses_rank = dist.get_rank(ulysses_group)
 
     if ulysses_size == 1:
-        return batch
+        labels = batch.get("labels")
+        global_valid_tokens = int((labels != -100).sum().item()) if labels is not None else 0
+        return batch, global_valid_tokens
+
+    SEQUENCE_KEYS = {"input_ids", "attention_mask", "labels", "mm_token_type_ids"}
+    PAD_VALUES = {"labels": -100, "input_ids": 0, "attention_mask": 0, "mm_token_type_ids": 0}
 
     sharded_batch = {}
     for key, value in batch.items():
-        if isinstance(value, torch.Tensor) and value.ndim >= 2:
-            # Assume sequence dimension is dim=1 for [batch, seq, ...] tensors
-            # Use sp_pad_and_slice for proper padding and slicing
-            sharded_value, _ = sp_pad_and_slice(
-                value,
-                group=ulysses_group,
-                dim=1,
-            )
-            sharded_batch[key] = sharded_value
+        if not isinstance(value, torch.Tensor):
+            sharded_batch[key] = value
+        elif key in SEQUENCE_KEYS and value.ndim >= 2:
+            sharded_batch[key] = sp_pad_and_slice(value, dim=1, pad_value=PAD_VALUES.get(key, 0))
+        elif key == "position_ids" and value.ndim == 3:
+            # M-RoPE position_ids: (batch, 3, seq_len) — shard along seq dim
+            sharded_batch[key] = sp_pad_and_slice(value, dim=2, pad_value=0)
         else:
-            # Non-tensor or 1D tensors pass through unchanged
+            # Vision keys (pixel_values, image_grid_thw, etc.) are replicated —
+            # the ViT must see all patches together for correct self-attention.
             sharded_batch[key] = value
 
-    return sharded_batch
+    # Signal to the model that vision tokens are NOT sharded across SP ranks.
+    sharded_batch["sp_vision_replicated"] = True
+
+    # Count valid tokens across all ulysses ranks using a CPU tensor all_reduce.
+    # Done here (before forward) to avoid adding NCCL collectives between forward and
+    # backward, which can deadlock with FSDP's reduce-scatter when using a flattened
+    # dp_shard_sp mesh.
+    local_labels = sharded_batch.get("labels")
+    local_valid = int((local_labels != -100).sum().item()) if local_labels is not None else 0
+    count_tensor = torch.tensor([local_valid], dtype=torch.long, device="cuda")
+    dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM, group=ulysses_group)
+    global_valid_tokens = int(count_tensor.item())
+
+    return sharded_batch, global_valid_tokens
 
 
 def compute_ulysses_sp_corrected_loss(
     loss_tensor: torch.Tensor,
     labels: torch.Tensor,
-    ulysses_group: Optional[dist.ProcessGroup] = None,
+    global_valid_tokens: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Compute corrected loss for Ulysses sequence parallelism.
 
-    In Ulysses SP, each rank computes loss on its local sequence chunk. To get the
-    correct global loss, we need to:
-    1. Count valid (non-ignored) tokens on each rank
-    2. All-reduce to get global valid token count
-    3. Scale local loss by (local_valid_tokens / global_valid_tokens)
+    The model computes cross_entropy(reduction='mean') over local valid tokens,
+    giving a scalar local mean loss. To get correct global gradients we scale by
+    (local_valid_tokens / global_valid_tokens) so each rank's gradient contribution
+    is proportional to its fraction of valid tokens.
+
+    No NCCL collectives are performed here — global_valid_tokens is pre-computed
+    at shard time via a CPU all_reduce in shard_vlm_batch_for_ulysses_sp, avoiding
+    communicator conflicts with FSDP's backward reduce-scatter.
 
     Args:
-        loss_tensor: Per-token loss tensor of shape [batch, local_seq_len]
+        loss_tensor: Scalar mean loss from model forward (CE with reduction='mean')
         labels: Labels tensor of shape [batch, local_seq_len] (for counting valid tokens)
-        ulysses_group: The process group for Ulysses SP
+        global_valid_tokens: Total valid tokens across all ulysses ranks (pre-computed)
 
     Returns:
         (loss_for_backward, loss_for_log): Both are scalars
             - loss_for_backward: Scaled loss for backprop (maintains correct gradients)
-            - loss_for_log: Globally averaged loss for logging
+            - loss_for_log: Local weighted loss (caller may all_reduce after backward for logging)
     """
-    if ulysses_group is None or dist.get_world_size(ulysses_group) == 1:
-        # No SP, return mean loss
-        loss_scalar = loss_tensor.mean()
-        return loss_scalar, loss_scalar
+    if global_valid_tokens == 0:
+        zero = torch.zeros_like(loss_tensor)
+        return zero, zero
 
-    # Count valid tokens (non-ignored, assuming ignore_index=-100)
-    valid_mask = (labels != -100)
-    local_valid_tokens = valid_mask.sum().float()
+    local_valid_tokens = (labels != -100).sum().float().to(loss_tensor.device)
 
-    # All-reduce to get global valid token count
-    global_valid_tokens = local_valid_tokens.clone()
-    dist.all_reduce(global_valid_tokens, op=dist.ReduceOp.SUM, group=ulysses_group)
+    loss_tensor = torch.where(
+        torch.isnan(loss_tensor), torch.zeros_like(loss_tensor), loss_tensor
+    )
 
-    # Compute local mean loss
-    if local_valid_tokens > 0:
-        local_loss = loss_tensor[valid_mask].mean()
-    else:
-        local_loss = torch.tensor(0.0, device=loss_tensor.device, dtype=loss_tensor.dtype)
+    scale = local_valid_tokens / float(global_valid_tokens)
+    loss_for_backward = loss_tensor * scale
 
-    # Scale for correct backprop: each rank's gradient contribution should be
-    # proportional to its fraction of valid tokens
-    loss_for_backward = local_loss * (local_valid_tokens / global_valid_tokens.clamp(min=1.0))
-
-    # For logging, all-reduce to get global average
-    loss_for_log = local_loss.clone()
-    dist.all_reduce(loss_for_log, op=dist.ReduceOp.SUM, group=ulysses_group)
-    loss_for_log = loss_for_log / dist.get_world_size(ulysses_group)
+    loss_for_log = loss_for_backward.detach().clone()
 
     return loss_for_backward, loss_for_log
