@@ -2427,7 +2427,7 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
                     print(f"  [DBG rank0] pre-slice inputs_embeds shape={inputs_embeds.shape} norm={inputs_embeds.float().norm().item():.4f} mean={inputs_embeds.float().mean().item():.6f}", flush=True)
             # Restore the layout to (batch, local_seq, full_hidden) for subsequent
             # transformer layers, which expect standard Sequence Parallel sharding.
-            inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
+            inputs_embeds = slice_input_tensor_scale_grad(inputs_embeds, dim=1, group=get_parallel_state().sp_group, scale_grad=False)
         # --- Patch.1 ---
 
         # DEBUG: checkpoint inputs_embeds before LLM
@@ -3070,4 +3070,5 @@ __all__ = [
     "Qwen3_5ForTokenClassification",
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5PreTrainedModel",
+]
 ]
